@@ -42,7 +42,9 @@ class UFFTorch(nn.Module):
     def __init__(self, inputs: UFFInputs):
         super().__init__()
         self.n_atoms = inputs.coordinates.shape[0]
-        self.register_buffer("reference_coords", inputs.coordinates)
+        self.reference_coords = nn.Parameter(
+            inputs.coordinates.clone().detach(), requires_grad=True
+        )
         self.register_buffer("bond_index", inputs.bond_index)
         self.register_buffer("bond_rest_length", inputs.bond_rest_length)
         self.register_buffer("bond_force_constant", inputs.bond_force_constant)
