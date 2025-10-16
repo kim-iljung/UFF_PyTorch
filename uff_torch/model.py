@@ -100,10 +100,11 @@ class UFFTorch(nn.Module):
         p3 = _gather(coords, self.angle_index[:, 2])
         v1 = p1 - p2
         v2 = p3 - p2
-        d1 = torch.sqrt((v1 * v1).sum(dim=-1))
-        d2 = torch.sqrt((v2 * v2).sum(dim=-1))
-        denom = torch.clamp(d1 * d2, min=1e-12)
-        cos_theta = torch.clamp((v1 * v2).sum(dim=-1) / denom, -0.999999, 0.999999)
+        dot = (v1 * v2).sum(dim=-1)
+        d1_sq = (v1 * v1).sum(dim=-1)
+        d2_sq = (v2 * v2).sum(dim=-1)
+        inv_denom = torch.rsqrt((d1_sq * d2_sq).clamp_min(1e-24))
+        cos_theta = torch.clamp(dot * inv_denom, -0.999999, 0.999999)
         sin_sq = torch.clamp(1.0 - cos_theta * cos_theta, min=1e-12)
         cos2 = cos_theta * cos_theta - sin_sq
         energy_term = self.angle_c0 + self.angle_c1 * cos_theta + self.angle_c2 * cos2
@@ -147,25 +148,39 @@ class UFFTorch(nn.Module):
         r4 = p4 - p3
         t1 = torch.cross(r1, r2, dim=-1)
         t2 = torch.cross(r3, r4, dim=-1)
-        d1 = torch.sqrt((t1 * t1).sum(dim=-1))
-        d2 = torch.sqrt((t2 * t2).sum(dim=-1))
-        denom = torch.clamp(d1 * d2, min=1e-12)
-        cos_phi = torch.clamp((t1 * t2).sum(dim=-1) / denom, -0.999999, 0.999999)
+        d1_sq = (t1 * t1).sum(dim=-1)
+        d2_sq = (t2 * t2).sum(dim=-1)
+        inv_denom = torch.rsqrt((d1_sq * d2_sq).clamp_min(1e-24))
+        cos_phi = torch.clamp((t1 * t2).sum(dim=-1) * inv_denom, -0.999999, 0.999999)
         sin_sq = torch.clamp(1.0 - cos_phi * cos_phi, min=1e-12)
         order = self.torsion_order
+        if coords.dim() == 3:
+            order = order.unsqueeze(0).expand_as(cos_phi)
         cos_n_phi = torch.zeros_like(cos_phi)
-        mask2 = order == 2
-        if mask2.any():
-            cos_n_phi[mask2] = 1.0 - 2.0 * sin_sq[mask2]
-        mask3 = order == 3
-        if mask3.any():
-            cp = cos_phi[mask3]
-            ss = sin_sq[mask3]
-            cos_n_phi[mask3] = cp * (cp * cp - 3.0 * ss)
-        mask6 = order == 6
-        if mask6.any():
-            ss = sin_sq[mask6]
-            cos_n_phi[mask6] = 1.0 + ss * (-32.0 * ss * ss + 48.0 * ss - 18.0)
+        if (order == 1).any():
+            cos_n_phi = torch.where(order == 1, cos_phi, cos_n_phi)
+        if (order == 2).any():
+            cos_n_phi = torch.where(order == 2, 1.0 - 2.0 * sin_sq, cos_n_phi)
+        if (order == 3).any():
+            cos_n_phi = torch.where(
+                order == 3,
+                cos_phi * (cos_phi * cos_phi - 3.0 * sin_sq),
+                cos_n_phi,
+            )
+        if (order == 4).any():
+            cos_sq = cos_phi * cos_phi
+            sin_sq_sq = sin_sq * sin_sq
+            cos_n_phi = torch.where(
+                order == 4,
+                cos_sq * cos_sq - 6.0 * cos_sq * sin_sq + sin_sq_sq,
+                cos_n_phi,
+            )
+        if (order == 6).any():
+            cos_n_phi = torch.where(
+                order == 6,
+                1.0 + sin_sq * (-32.0 * sin_sq * sin_sq + 48.0 * sin_sq - 18.0),
+                cos_n_phi,
+            )
         energy = 0.5 * self.torsion_force_constant * (1.0 - self.torsion_cos_term * cos_n_phi)
         return energy.sum() if coords.dim() == 2 else energy.sum(dim=-1)
 
@@ -208,16 +223,18 @@ class UFFTorch(nn.Module):
             return torch.zeros((), device=coords.device, dtype=coords.dtype)
         diff = _pair_vectors(coords, self.nonbond_index)
         dist_sq = (diff * diff).sum(dim=-1)
-        dist = torch.sqrt(dist_sq)
-        thresh = self.vdw_threshold
-        valid = (dist > 0) & (dist <= thresh)
         inv_dist = torch.rsqrt(dist_sq.clamp_min(1e-12))
         if coords.dim() == 2:
+            thresh = self.vdw_threshold
+            thresh_sq = thresh * thresh
             vdw_min = self.vdw_minimum
             vdw_depth = self.vdw_well_depth
         else:
+            thresh = self.vdw_threshold.unsqueeze(0)
+            thresh_sq = thresh * thresh
             vdw_min = self.vdw_minimum.unsqueeze(0)
             vdw_depth = self.vdw_well_depth.unsqueeze(0)
+        valid = (dist_sq > 0) & (dist_sq <= thresh_sq)
         r = vdw_min * inv_dist
         r6 = r.pow(6)
         r12 = r6 * r6
