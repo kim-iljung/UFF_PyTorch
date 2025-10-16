@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
+from .atom_typing import uff_atom_type
 from .parameters import UFFAtomParameters, get_atom_parameters
 from .utils import (
     calc_angle_c_terms,
@@ -83,30 +84,11 @@ def _ensure_conformer(mol, conf_id: Optional[int]):
 
 
 def _compute_atom_types(mol) -> Tuple[List[str], List[Optional[UFFAtomParameters]], bool]:
-    from rdkit.Chem import rdForceFieldHelpers
-
-    if hasattr(rdForceFieldHelpers, "UFFGetAtomType"):
-        get_atom_type = rdForceFieldHelpers.UFFGetAtomType
-    elif hasattr(rdForceFieldHelpers, "GetUFFAtomType"):
-        get_atom_type = rdForceFieldHelpers.GetUFFAtomType
-    elif hasattr(rdForceFieldHelpers, "GetUFFAtomTypes"):
-        def get_atom_type(molecule, atom_idx):
-            types = rdForceFieldHelpers.GetUFFAtomTypes(molecule)
-            if isinstance(types, dict):
-                return types.get(atom_idx, "")
-            return types[atom_idx]
-    else:  # pragma: no cover - depends on RDKit availability
-        raise AttributeError(
-            "The installed RDKit version does not expose a UFF atom typing helper."
-        )
-
     atom_types: List[str] = []
     params: List[Optional[UFFAtomParameters]] = []
     all_found = True
     for atom in mol.GetAtoms():
-        atom_type = get_atom_type(mol, atom.GetIdx())
-        if isinstance(atom_type, tuple):
-            atom_type = atom_type[0]
+        atom_type = uff_atom_type(atom)
         if not atom_type:
             all_found = False
             atom_types.append("")
