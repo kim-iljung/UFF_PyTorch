@@ -87,7 +87,7 @@ class UFFTorch(nn.Module):
         if self.bond_index.numel() == 0:
             return torch.zeros((), device=coords.device, dtype=coords.dtype)
         diff = _pair_vectors(coords, self.bond_index)
-        dist = torch.linalg.norm(diff, dim=-1)
+        dist = torch.sqrt((diff * diff).sum(dim=-1))
         stretch = dist - self.bond_rest_length
         energy = 0.5 * self.bond_force_constant * stretch * stretch
         return energy.sum() if coords.dim() == 2 else energy.sum(dim=-1)
@@ -100,8 +100,8 @@ class UFFTorch(nn.Module):
         p3 = _gather(coords, self.angle_index[:, 2])
         v1 = p1 - p2
         v2 = p3 - p2
-        d1 = torch.linalg.norm(v1, dim=-1)
-        d2 = torch.linalg.norm(v2, dim=-1)
+        d1 = torch.sqrt((v1 * v1).sum(dim=-1))
+        d2 = torch.sqrt((v2 * v2).sum(dim=-1))
         denom = torch.clamp(d1 * d2, min=1e-12)
         cos_theta = torch.clamp((v1 * v2).sum(dim=-1) / denom, -0.999999, 0.999999)
         sin_sq = torch.clamp(1.0 - cos_theta * cos_theta, min=1e-12)
@@ -109,29 +109,28 @@ class UFFTorch(nn.Module):
         energy_term = self.angle_c0 + self.angle_c1 * cos_theta + self.angle_c2 * cos2
         if (self.angle_order > 0).any():
             order = self.angle_order.to(coords.dtype)
+            if coords.dim() == 3:
+                order = order.unsqueeze(0)
+            order = order.expand_as(cos_theta)
             mask = order > 0
             if mask.any():
-                cos_theta_m = cos_theta[mask]
-                sin_sq_m = sin_sq[mask]
-                order_m = order[mask]
-                cos2_m = cos2[mask]
-                terms = torch.zeros_like(cos_theta_m)
-                is1 = order_m == 1
-                if is1.any():
-                    terms[is1] = -cos_theta_m[is1]
-                is2 = order_m == 2
-                if is2.any():
-                    terms[is2] = cos2_m[is2]
-                is3 = order_m == 3
-                if is3.any():
-                    terms[is3] = cos_theta_m[is3] * (cos_theta_m[is3] * cos_theta_m[is3] - 3.0 * sin_sq_m[is3])
-                is4 = order_m == 4
-                if is4.any():
-                    ct = cos_theta_m[is4]
-                    ss = sin_sq_m[is4]
-                    terms[is4] = ct * ct * ct * ct - 6.0 * ct * ct * ss + ss * ss
-                energy_term = energy_term.clone()
-                energy_term[mask] = (1.0 - terms) / torch.clamp(order_m * order_m, min=1.0)
+                cos_sq = cos_theta * cos_theta
+                terms = torch.zeros_like(cos_theta)
+                terms = torch.where(order == 1, -cos_theta, terms)
+                terms = torch.where(order == 2, cos2, terms)
+                terms = torch.where(
+                    order == 3,
+                    cos_theta * (cos_sq - 3.0 * sin_sq),
+                    terms,
+                )
+                terms = torch.where(
+                    order == 4,
+                    cos_sq * cos_sq - 6.0 * cos_sq * sin_sq + sin_sq * sin_sq,
+                    terms,
+                )
+                denom = torch.clamp(order * order, min=1.0)
+                replacement = (1.0 - terms) / denom
+                energy_term = torch.where(mask, replacement, energy_term)
         energy = self.angle_force_constant * energy_term
         return energy.sum() if coords.dim() == 2 else energy.sum(dim=-1)
 
@@ -148,8 +147,8 @@ class UFFTorch(nn.Module):
         r4 = p4 - p3
         t1 = torch.cross(r1, r2, dim=-1)
         t2 = torch.cross(r3, r4, dim=-1)
-        d1 = torch.linalg.norm(t1, dim=-1)
-        d2 = torch.linalg.norm(t2, dim=-1)
+        d1 = torch.sqrt((t1 * t1).sum(dim=-1))
+        d2 = torch.sqrt((t2 * t2).sum(dim=-1))
         denom = torch.clamp(d1 * d2, min=1e-12)
         cos_phi = torch.clamp((t1 * t2).sum(dim=-1) / denom, -0.999999, 0.999999)
         sin_sq = torch.clamp(1.0 - cos_phi * cos_phi, min=1e-12)
@@ -184,16 +183,16 @@ class UFFTorch(nn.Module):
         r_ji = p_i - p_j
         r_jk = p_k - p_j
         r_jl = p_l - p_j
-        d_ji = torch.linalg.norm(r_ji, dim=-1)
-        d_jk = torch.linalg.norm(r_jk, dim=-1)
-        d_jl = torch.linalg.norm(r_jl, dim=-1)
+        d_ji = torch.sqrt((r_ji * r_ji).sum(dim=-1))
+        d_jk = torch.sqrt((r_jk * r_jk).sum(dim=-1))
+        d_jl = torch.sqrt((r_jl * r_jl).sum(dim=-1))
         mask = (d_ji > 1e-8) & (d_jk > 1e-8) & (d_jl > 1e-8)
         safe = mask.float()
         r_ji = r_ji / torch.clamp(d_ji.unsqueeze(-1), min=1e-8)
         r_jk = r_jk / torch.clamp(d_jk.unsqueeze(-1), min=1e-8)
         r_jl = r_jl / torch.clamp(d_jl.unsqueeze(-1), min=1e-8)
         n = torch.cross(-r_ji, r_jk, dim=-1)
-        n_norm = torch.linalg.norm(n, dim=-1)
+        n_norm = torch.sqrt((n * n).sum(dim=-1))
         n = n / torch.clamp(n_norm.unsqueeze(-1), min=1e-8)
         cos_y = torch.clamp((n * r_jl).sum(dim=-1), -0.999999, 0.999999)
         sin_y = torch.sqrt(torch.clamp(1.0 - cos_y * cos_y, min=1e-12))
@@ -208,26 +207,20 @@ class UFFTorch(nn.Module):
         if self.nonbond_index.numel() == 0:
             return torch.zeros((), device=coords.device, dtype=coords.dtype)
         diff = _pair_vectors(coords, self.nonbond_index)
-        dist = torch.linalg.norm(diff, dim=-1)
+        dist_sq = (diff * diff).sum(dim=-1)
+        dist = torch.sqrt(dist_sq)
         thresh = self.vdw_threshold
-        mask = dist > 0
+        valid = (dist > 0) & (dist <= thresh)
+        inv_dist = torch.rsqrt(dist_sq.clamp_min(1e-12))
         if coords.dim() == 2:
-            energy = torch.zeros((dist.shape[0],), device=coords.device, dtype=coords.dtype)
-            valid = mask & (dist <= thresh)
-            if valid.any():
-                r = self.vdw_minimum[valid] / dist[valid]
-                r6 = r.pow(6)
-                r12 = r6 * r6
-                energy[valid] = self.vdw_well_depth[valid] * (r12 - 2.0 * r6)
-            return energy.sum()
+            vdw_min = self.vdw_minimum
+            vdw_depth = self.vdw_well_depth
         else:
-            energy = torch.zeros((coords.shape[0], dist.shape[1]), device=coords.device, dtype=coords.dtype)
-            valid = mask & (dist <= thresh)
-            if valid.any():
-                vdw_min = self.vdw_minimum.unsqueeze(0).expand_as(dist)
-                vdw_depth = self.vdw_well_depth.unsqueeze(0).expand_as(dist)
-                r = vdw_min[valid] / dist[valid]
-                r6 = r.pow(6)
-                r12 = r6 * r6
-                energy[valid] = vdw_depth[valid] * (r12 - 2.0 * r6)
-            return energy.sum(dim=-1)
+            vdw_min = self.vdw_minimum.unsqueeze(0)
+            vdw_depth = self.vdw_well_depth.unsqueeze(0)
+        r = vdw_min * inv_dist
+        r6 = r.pow(6)
+        r12 = r6 * r6
+        energy = vdw_depth * (r12 - 2.0 * r6)
+        energy = energy.masked_fill(~valid, 0.0)
+        return energy.sum() if coords.dim() == 2 else energy.sum(dim=-1)
