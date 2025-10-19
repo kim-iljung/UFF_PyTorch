@@ -60,11 +60,9 @@ if _HAS_TRITON:
         stride_coords_dim,
         stride_index_pair,
         stride_index_component,
-        *,
-        BLOCK_SIZE: tl.constexpr,
     ):
         pid = tl.program_id(0)
-        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        offsets = pid * _BLOCK_SIZE + tl.arange(0, _BLOCK_SIZE)
         mask = offsets < n_pairs
 
         index_offsets = offsets * stride_index_pair
@@ -147,11 +145,9 @@ if _HAS_TRITON:
         stride_coords_dim,
         stride_index_pair,
         stride_index_component,
-        *,
-        BLOCK_SIZE: tl.constexpr,
     ):
         pid = tl.program_id(0)
-        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        offsets = pid * _BLOCK_SIZE + tl.arange(0, _BLOCK_SIZE)
         mask = offsets < n_pairs
 
         index_offsets = offsets * stride_index_pair
@@ -292,8 +288,8 @@ if _HAS_TRITON:
                 (n_pairs,), device=coords.device, dtype=coords.dtype
             )
 
-            grid: Callable[[dict], tuple[int, ...]] = lambda meta: (
-                triton.cdiv(n_pairs, meta["BLOCK_SIZE"]),
+            grid: Callable[[dict], tuple[int, ...]] = lambda _: (
+                triton.cdiv(n_pairs, _BLOCK_SIZE),
             )
             _nonbonded_forward_kernel[grid](
                 coords_contig,
@@ -307,7 +303,6 @@ if _HAS_TRITON:
                 coords_contig.stride(1),
                 index_contig.stride(0),
                 index_contig.stride(1),
-                BLOCK_SIZE=_BLOCK_SIZE,
             )
 
             ctx.save_for_backward(
@@ -331,8 +326,8 @@ if _HAS_TRITON:
             grad_coords = torch.zeros_like(coords)
 
             if ctx.n_pairs:
-                grid: Callable[[dict], tuple[int, ...]] = lambda meta: (
-                    triton.cdiv(ctx.n_pairs, meta["BLOCK_SIZE"]),
+                grid: Callable[[dict], tuple[int, ...]] = lambda _: (
+                    triton.cdiv(ctx.n_pairs, _BLOCK_SIZE),
                 )
                 _nonbonded_backward_kernel[grid](
                     coords,
@@ -346,7 +341,6 @@ if _HAS_TRITON:
                     ctx.stride_coords_dim,
                     ctx.stride_index_pair,
                     ctx.stride_index_component,
-                    BLOCK_SIZE=_BLOCK_SIZE,
                 )
 
             grad_coords.mul_(grad_output)
