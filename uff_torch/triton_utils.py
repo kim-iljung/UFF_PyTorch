@@ -120,7 +120,7 @@ if _HAS_TRITON:
 
         dist_sq = tl.where(valid, dist_sq, 1.0)
         dist_sq = tl.maximum(dist_sq, 1e-12)
-        inv_dist = 1.0 / tl.sqrt(dist_sq)
+        inv_dist = tl.rsqrt(dist_sq)
 
         vdw_min = tl.load(vdw_min_ptr + offsets, mask=mask, other=0.0)
         depth = tl.load(vdw_depth_ptr + offsets, mask=mask, other=0.0)
@@ -207,7 +207,7 @@ if _HAS_TRITON:
 
         dist_sq = tl.where(valid, dist_sq, 1.0)
         dist_sq = tl.maximum(dist_sq, 1e-12)
-        inv_dist = 1.0 / tl.sqrt(dist_sq)
+        inv_dist = tl.rsqrt(dist_sq)
 
         vdw_min = tl.load(vdw_min_ptr + offsets, mask=mask, other=0.0)
         depth = tl.load(vdw_depth_ptr + offsets, mask=mask, other=0.0)
