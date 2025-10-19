@@ -8,7 +8,6 @@ import torch
 from torch import nn
 
 from .builder import UFFInputs
-from .triton_utils import supports_triton_nonbonded, triton_nonbonded_energy
 
 
 def _prepare_coords(coords: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
@@ -96,12 +95,6 @@ class UFFTorch(nn.Module):
         self.register_buffer("inversion_c1", inputs.inversion_c1)
         self.register_buffer("inversion_c2", inputs.inversion_c2)
         self.register_buffer("nonbond_index", inputs.nonbond_index)
-        self.register_buffer(
-            "nonbond_index_int32",
-            inputs.nonbond_index.to(dtype=torch.int32)
-            if inputs.nonbond_index.numel()
-            else inputs.nonbond_index.new_empty((0, 2), dtype=torch.int32),
-        )
         self.register_buffer("vdw_minimum", inputs.vdw_minimum)
         self.register_buffer("vdw_well_depth", inputs.vdw_well_depth)
         self.register_buffer("vdw_threshold", inputs.vdw_threshold)
@@ -269,22 +262,6 @@ class UFFTorch(nn.Module):
     def _nonbonded_energy(self, coords: torch.Tensor) -> torch.Tensor:
         if self.nonbond_index.numel() == 0:
             return torch.zeros((), device=coords.device, dtype=coords.dtype)
-        if supports_triton_nonbonded(
-            coords,
-            self.vdw_minimum,
-            self.vdw_well_depth,
-            self.vdw_threshold_sq,
-        ):
-            try:
-                return triton_nonbonded_energy(
-                    coords,
-                    self.nonbond_index_int32,
-                    self.vdw_minimum,
-                    self.vdw_well_depth,
-                    self.vdw_threshold_sq,
-                )
-            except RuntimeError:
-                pass
         diff = _pair_vectors(coords, self.nonbond_index)
         dist_sq = (diff * diff).sum(dim=-1)
         inv_dist = torch.rsqrt(dist_sq.clamp_min(1e-12))
