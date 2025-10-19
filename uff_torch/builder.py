@@ -15,6 +15,8 @@ from .utils import (
     calc_bond_force_constant,
     calc_bond_rest_length,
     calc_inversion_coefficients_and_force_constant,
+    calc_nonbonded_depth,
+    calc_nonbonded_minimum,
     neighbour_matrix,
     torsion_parameters,
 )
@@ -45,13 +47,10 @@ class UFFInputs:
     inversion_c0: torch.Tensor
     inversion_c1: torch.Tensor
     inversion_c2: torch.Tensor
-    vdw_sigma: torch.Tensor
-    vdw_epsilon: torch.Tensor
-    vdw_mask: torch.Tensor
-    nonbond_relation: torch.Tensor
-    fragment_ids: Optional[torch.Tensor]
-    vdw_distance_multiplier: float
-    max_vdw_cutoff: float
+    nonbond_index: torch.Tensor
+    vdw_minimum: torch.Tensor
+    vdw_well_depth: torch.Tensor
+    vdw_threshold: torch.Tensor
 
 
 def _as_tensor(data: Sequence[float], device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -280,6 +279,10 @@ def build_uff_inputs(
 
     bonds = [(i, j) for i, j in bond_index]
     relation = neighbour_matrix(mol.GetNumAtoms(), bonds)
+    nonbond_pairs: List[Tuple[int, int]] = []
+    vdw_min: List[float] = []
+    vdw_depth: List[float] = []
+    vdw_thresh: List[float] = []
     fragment_labels: Optional[List[int]] = None
     if ignore_interfragment_interactions:
         from rdkit.Chem import rdmolops
@@ -289,32 +292,28 @@ def build_uff_inputs(
         for frag_id, atoms in enumerate(frags):
             for idx in atoms:
                 fragment_labels[idx] = frag_id
-
-    sigma_values: List[float] = []
-    epsilon_values: List[float] = []
-    vdw_mask: List[bool] = []
-    for params in atom_params:
-        if params is None:
-            sigma_values.append(0.0)
-            epsilon_values.append(0.0)
-            vdw_mask.append(False)
-        else:
-            sigma_values.append(params.x1)
-            epsilon_values.append(params.D1)
-            vdw_mask.append(True)
-
-    sigma_tensor_raw = _as_tensor(sigma_values, device, dtype)
-    epsilon_tensor_raw = _as_tensor(epsilon_values, device, dtype)
-    vdw_sigma_tensor = sigma_tensor_raw.sqrt()
-    vdw_epsilon_tensor = epsilon_tensor_raw.sqrt()
-    max_sigma = float(vdw_sigma_tensor.max().item()) if vdw_sigma_tensor.numel() else 0.0
-    fragment_tensor = (
-        torch.tensor(fragment_labels, device=device, dtype=torch.long)
-        if fragment_labels is not None
-        else None
-    )
-    relation_tensor = torch.tensor(relation, device=device, dtype=torch.long)
-    vdw_mask_tensor = torch.tensor(vdw_mask, device=device, dtype=torch.bool)
+    for i in range(mol.GetNumAtoms()):
+        params_i = atom_params[i]
+        if params_i is None:
+            continue
+        for j in range(i + 1, mol.GetNumAtoms()):
+            params_j = atom_params[j]
+            if params_j is None:
+                continue
+            if fragment_labels is not None and fragment_labels[i] != fragment_labels[j]:
+                continue
+            if relation[i][j] < 2:
+                continue
+            pos_i = conf.GetAtomPosition(i)
+            pos_j = conf.GetAtomPosition(j)
+            dist = (pos_i - pos_j).Length()
+            minimum = calc_nonbonded_minimum(params_i, params_j)
+            if dist > vdw_distance_multiplier * minimum:
+                continue
+            nonbond_pairs.append((i, j))
+            vdw_min.append(minimum)
+            vdw_depth.append(calc_nonbonded_depth(params_i, params_j))
+            vdw_thresh.append(vdw_distance_multiplier * minimum)
 
     return UFFInputs(
         atom_types=atom_types,
@@ -342,11 +341,8 @@ def build_uff_inputs(
         inversion_c0=_as_tensor(inversion_c0, device, dtype),
         inversion_c1=_as_tensor(inversion_c1, device, dtype),
         inversion_c2=_as_tensor(inversion_c2, device, dtype),
-        vdw_sigma=vdw_sigma_tensor,
-        vdw_epsilon=vdw_epsilon_tensor,
-        vdw_mask=vdw_mask_tensor,
-        nonbond_relation=relation_tensor,
-        fragment_ids=fragment_tensor,
-        vdw_distance_multiplier=vdw_distance_multiplier,
-        max_vdw_cutoff=vdw_distance_multiplier * max_sigma,
+        nonbond_index=_as_index_tensor(nonbond_pairs, device, 2),
+        vdw_minimum=_as_tensor(vdw_min, device, dtype),
+        vdw_well_depth=_as_tensor(vdw_depth, device, dtype),
+        vdw_threshold=_as_tensor(vdw_thresh, device, dtype),
     )
