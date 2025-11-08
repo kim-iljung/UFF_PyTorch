@@ -19,7 +19,7 @@ energies and forces can be obtained via autograd.
 You can install the package from a Git checkout:
 
 ```bash
-pip install git+https://github.com/openai/UFF_PyTorch.git
+pip install git+https://github.com/kim-iljung/UFF_PyTorch.git
 ```
 
 ## Quick start
