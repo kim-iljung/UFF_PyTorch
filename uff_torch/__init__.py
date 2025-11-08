@@ -11,4 +11,6 @@ computed with autograd.
 from .builder import build_uff_inputs
 from .model import UFFTorch
 
-__all__ = ["build_uff_inputs", "UFFTorch"]
+__version__ = "0.1.0"
+
+__all__ = ["build_uff_inputs", "UFFTorch", "__version__"]

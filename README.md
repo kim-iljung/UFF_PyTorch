@@ -14,6 +14,14 @@ energies and forces can be obtained via autograd.
 - A `torch.nn.Module` wrapper that evaluates the total UFF energy and its
   individual components on CPU or GPU.
 
+## Installation
+
+You can install the package from a Git checkout:
+
+```bash
+pip install git+https://github.com/openai/UFF_PyTorch.git
+```
+
 ## Quick start
 
 ```python
