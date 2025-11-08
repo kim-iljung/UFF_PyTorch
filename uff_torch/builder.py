@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -51,6 +51,7 @@ class UFFInputs:
     vdw_minimum: torch.Tensor
     vdw_well_depth: torch.Tensor
     vdw_threshold: torch.Tensor
+    batch_coordinates: Optional[torch.Tensor] = None
 
 
 def _as_tensor(data: Sequence[float], device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -99,25 +100,27 @@ def _compute_atom_types(mol) -> Tuple[List[str], List[Optional[UFFAtomParameters
     return atom_types, params, all_found
 
 
-def build_uff_inputs(
+def _build_single_inputs(
     mol,
     *,
-    conf_id: Optional[int] = None,
-    device: Optional[torch.device] = None,
-    dtype: torch.dtype = torch.double,
-    vdw_distance_multiplier: float = 4.0,
-    ignore_interfragment_interactions: bool = False,
+    conf_id: Optional[int],
+    device: torch.device,
+    dtype: torch.dtype,
+    vdw_distance_multiplier: float,
+    ignore_interfragment_interactions: bool,
 ) -> UFFInputs:
-    """Generate :class:`UFFInputs` tensors from an RDKit molecule."""
-
-    if device is None:
-        device = torch.device("cpu")
     conf_id, conf = _ensure_conformer(mol, conf_id)
     atom_types, atom_params, _ = _compute_atom_types(mol)
 
     coords = torch.tensor(
-        [(conf.GetAtomPosition(i).x, conf.GetAtomPosition(i).y, conf.GetAtomPosition(i).z)
-         for i in range(mol.GetNumAtoms())],
+        [
+            (
+                conf.GetAtomPosition(i).x,
+                conf.GetAtomPosition(i).y,
+                conf.GetAtomPosition(i).z,
+            )
+            for i in range(mol.GetNumAtoms())
+        ],
         dtype=dtype,
         device=device,
     )
@@ -346,3 +349,175 @@ def build_uff_inputs(
         vdw_well_depth=_as_tensor(vdw_depth, device, dtype),
         vdw_threshold=_as_tensor(vdw_thresh, device, dtype),
     )
+
+
+def _is_molecule(obj) -> bool:
+    return hasattr(obj, "GetNumAtoms") and callable(getattr(obj, "GetNumAtoms"))
+
+
+def _normalise_conf_ids(
+    conf_id: Optional[Union[int, Sequence[Optional[int]]]], n: int
+) -> List[Optional[int]]:
+    if conf_id is None or isinstance(conf_id, int):
+        return [conf_id] * n
+    if isinstance(conf_id, Sequence) and not isinstance(conf_id, (str, bytes)):
+        if len(conf_id) != n:
+            raise ValueError(
+                "The number of conformer identifiers must match the number of molecules."
+            )
+        normalised: List[Optional[int]] = []
+        for idx, value in enumerate(conf_id):
+            if value is None or isinstance(value, int):
+                normalised.append(value)
+            else:
+                raise TypeError(
+                    "Conformer identifiers must be integers or ``None`` values."
+                )
+        return normalised
+    raise TypeError(
+        "The ``conf_id`` argument must be an integer, ``None`` or a sequence of those values."
+    )
+
+
+def _ensure_same_topology(reference: UFFInputs, candidate: UFFInputs, index: int) -> None:
+    if reference.atom_types != candidate.atom_types:
+        raise ValueError(
+            "All molecules in the batch must have identical atom typing; "
+            f"entry {index} does not match the reference."
+        )
+    ref_params = reference.atom_params
+    cand_params = candidate.atom_params
+    if len(ref_params) != len(cand_params):
+        raise ValueError(
+            "All molecules in the batch must contain the same number of atoms."
+        )
+    for idx, (ref_param, cand_param) in enumerate(zip(ref_params, cand_params)):
+        if (ref_param is None) != (cand_param is None):
+            raise ValueError(
+                "All molecules in the batch must agree on atom typing; "
+                f"atom {idx} in entry {index} differs."
+            )
+    tensor_fields: Iterable[str] = (
+        "bond_index",
+        "bond_rest_length",
+        "bond_force_constant",
+        "angle_index",
+        "angle_force_constant",
+        "angle_c0",
+        "angle_c1",
+        "angle_c2",
+        "angle_order",
+        "torsion_index",
+        "torsion_force_constant",
+        "torsion_order",
+        "torsion_cos_term",
+        "inversion_index",
+        "inversion_force_constant",
+        "inversion_c0",
+        "inversion_c1",
+        "inversion_c2",
+        "nonbond_index",
+        "vdw_minimum",
+        "vdw_well_depth",
+        "vdw_threshold",
+    )
+    for field in tensor_fields:
+        ref_tensor = getattr(reference, field)
+        cand_tensor = getattr(candidate, field)
+        if ref_tensor.shape != cand_tensor.shape or not torch.equal(ref_tensor, cand_tensor):
+            raise ValueError(
+                "All molecules in the batch must yield identical UFF tensors; "
+                f"field ``{field}`` differs for entry {index}."
+            )
+
+
+def build_uff_inputs(
+    mol,
+    *,
+    conf_id: Optional[Union[int, Sequence[Optional[int]]]] = None,
+    device: Optional[torch.device] = None,
+    dtype: torch.dtype = torch.double,
+    vdw_distance_multiplier: float = 4.0,
+    ignore_interfragment_interactions: bool = False,
+) -> UFFInputs:
+    """Generate :class:`UFFInputs` tensors from one or multiple RDKit molecules.
+
+    When ``mol`` is a sequence, the molecules must yield identical UFF topology
+    tensors.  The returned instance keeps the tensors from the first entry for
+    compatibility and exposes stacked coordinates through the
+    :attr:`UFFInputs.batch_coordinates` attribute so they can be passed directly
+    to :meth:`UFFTorch.forward`.
+    """
+
+    if device is None:
+        device = torch.device("cpu")
+
+    if _is_molecule(mol):
+        (conf_choice,) = _normalise_conf_ids(conf_id, 1)
+        return _build_single_inputs(
+            mol,
+            conf_id=conf_choice,
+            device=device,
+            dtype=dtype,
+            vdw_distance_multiplier=vdw_distance_multiplier,
+            ignore_interfragment_interactions=ignore_interfragment_interactions,
+        )
+
+    if isinstance(mol, Sequence) and not isinstance(mol, (str, bytes)):
+        mols = list(mol)
+        if not mols:
+            raise ValueError("The sequence of molecules cannot be empty.")
+        if not all(_is_molecule(entry) for entry in mols):
+            raise TypeError("All entries must be RDKit molecule objects.")
+        conf_ids = _normalise_conf_ids(conf_id, len(mols))
+        reference = _build_single_inputs(
+            mols[0],
+            conf_id=conf_ids[0],
+            device=device,
+            dtype=dtype,
+            vdw_distance_multiplier=vdw_distance_multiplier,
+            ignore_interfragment_interactions=ignore_interfragment_interactions,
+        )
+        batch_coords = [reference.coordinates]
+        for idx, (entry, conf_choice) in enumerate(zip(mols[1:], conf_ids[1:]), start=1):
+            candidate = _build_single_inputs(
+                entry,
+                conf_id=conf_choice,
+                device=device,
+                dtype=dtype,
+                vdw_distance_multiplier=vdw_distance_multiplier,
+                ignore_interfragment_interactions=ignore_interfragment_interactions,
+            )
+            _ensure_same_topology(reference, candidate, idx)
+            batch_coords.append(candidate.coordinates)
+        stacked = torch.stack(batch_coords, dim=0)
+        return UFFInputs(
+            atom_types=reference.atom_types,
+            atom_params=reference.atom_params,
+            coordinates=reference.coordinates,
+            batch_coordinates=stacked,
+            bond_index=reference.bond_index,
+            bond_rest_length=reference.bond_rest_length,
+            bond_force_constant=reference.bond_force_constant,
+            angle_index=reference.angle_index,
+            angle_force_constant=reference.angle_force_constant,
+            angle_c0=reference.angle_c0,
+            angle_c1=reference.angle_c1,
+            angle_c2=reference.angle_c2,
+            angle_order=reference.angle_order,
+            torsion_index=reference.torsion_index,
+            torsion_force_constant=reference.torsion_force_constant,
+            torsion_order=reference.torsion_order,
+            torsion_cos_term=reference.torsion_cos_term,
+            inversion_index=reference.inversion_index,
+            inversion_force_constant=reference.inversion_force_constant,
+            inversion_c0=reference.inversion_c0,
+            inversion_c1=reference.inversion_c1,
+            inversion_c2=reference.inversion_c2,
+            nonbond_index=reference.nonbond_index,
+            vdw_minimum=reference.vdw_minimum,
+            vdw_well_depth=reference.vdw_well_depth,
+            vdw_threshold=reference.vdw_threshold,
+        )
+
+    raise TypeError("The ``mol`` argument must be an RDKit molecule or a sequence of them.")
