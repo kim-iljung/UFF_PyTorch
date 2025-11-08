@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "uff-torch"
+version = "0.1.0"
+description = "PyTorch implementation of the Universal Force Field (UFF)."
+readme = "README.md"
+license = {file = "LICENSE"}
+authors = [
+  {name = "UFF PyTorch contributors"}
+]
+requires-python = ">=3.8"
+dependencies = [
+  "torch>=1.12",
+  "rdkit>=2022.3.1"
+]
+classifiers = [
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: BSD License",
+  "Operating System :: OS Independent",
+  "Topic :: Scientific/Engineering :: Chemistry",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence"
+]
+
+[project.urls]
+"Source" = "https://github.com/openai/UFF_PyTorch"
+"Issues" = "https://github.com/openai/UFF_PyTorch/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["uff_torch*"]
+
+[tool.setuptools.package-data]
+"uff_torch" = ["data/*.json"]
