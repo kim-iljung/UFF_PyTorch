@@ -26,8 +26,8 @@ classifiers = [
 ]
 
 [project.urls]
-"Source" = "https://github.com/openai/UFF_PyTorch"
-"Issues" = "https://github.com/openai/UFF_PyTorch/issues"
+"Source" = "https://github.com/kim-iljung/UFF_PyTorch"
+"Issues" = "https://github.com/kim-iljung/UFF_PyTorch/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
