@@ -8,9 +8,9 @@ while exposing vectorised PyTorch kernels so that energies and forces can be
 computed with autograd.
 """
 
-from .builder import build_uff_inputs
+from .builder import build_uff_inputs, merge_uff_inputs
 from .model import UFFTorch
 
 __version__ = "0.1.0"
 
-__all__ = ["build_uff_inputs", "UFFTorch", "__version__"]
+__all__ = ["build_uff_inputs", "merge_uff_inputs", "UFFTorch", "__version__"]

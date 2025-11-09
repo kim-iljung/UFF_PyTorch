@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import torch
 from torch import nn
 
 from .builder import UFFInputs
+from .utils import calc_nonbonded_depth, calc_nonbonded_minimum, neighbour_matrix
 
 
 def _prepare_coords(coords: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
@@ -100,9 +101,61 @@ class UFFTorch(nn.Module):
         self.register_buffer("vdw_threshold", inputs.vdw_threshold)
         self.register_buffer("vdw_threshold_sq", inputs.vdw_threshold.square())
 
+        self._vdw_distance_multiplier = float(inputs.vdw_distance_multiplier)
+        fragment_ids = inputs.fragment_ids
+        allow_interfragment = inputs.allow_interfragment_interactions
+        if inputs.bond_index.numel():
+            bonds = [(int(i), int(j)) for i, j in inputs.bond_index.detach().cpu().tolist()]
+        else:
+            bonds = []
+        relation = neighbour_matrix(self.n_atoms, bonds)
+        candidate_pairs: List[tuple[int, int]] = []
+        candidate_min: List[float] = []
+        candidate_depth: List[float] = []
+        for idx_i, params_i in enumerate(inputs.atom_params):
+            if params_i is None:
+                continue
+            for idx_j in range(idx_i + 1, self.n_atoms):
+                params_j = inputs.atom_params[idx_j]
+                if params_j is None:
+                    continue
+                if relation[idx_i][idx_j] < 2:
+                    continue
+                if (
+                    not allow_interfragment
+                    and fragment_ids is not None
+                    and fragment_ids[idx_i] != fragment_ids[idx_j]
+                ):
+                    continue
+                candidate_pairs.append((idx_i, idx_j))
+                candidate_min.append(calc_nonbonded_minimum(params_i, params_j))
+                candidate_depth.append(calc_nonbonded_depth(params_i, params_j))
+        device = self.reference_coords.device
+        dtype = self.reference_coords.dtype
+        if candidate_pairs:
+            candidate_index = torch.tensor(candidate_pairs, device=device, dtype=torch.long)
+            candidate_minimum = torch.tensor(candidate_min, device=device, dtype=dtype)
+            candidate_depth = torch.tensor(candidate_depth, device=device, dtype=dtype)
+        else:
+            candidate_index = torch.empty((0, 2), device=device, dtype=torch.long)
+            candidate_minimum = torch.empty((0,), device=device, dtype=dtype)
+            candidate_depth = torch.empty((0,), device=device, dtype=dtype)
+        candidate_threshold = candidate_minimum * self._vdw_distance_multiplier
+        candidate_threshold_sq = candidate_threshold.square()
+        self.register_buffer("nonbond_candidate_index", candidate_index)
+        self.register_buffer("nonbond_candidate_minimum", candidate_minimum)
+        self.register_buffer("nonbond_candidate_well_depth", candidate_depth)
+        self.register_buffer("nonbond_candidate_threshold", candidate_threshold)
+        self.register_buffer("nonbond_candidate_threshold_sq", candidate_threshold_sq)
+
+        with torch.no_grad():
+            self._refresh_nonbond_pairs(self.reference_coords)
+
     def forward(self, coords: Optional[torch.Tensor] = None, *, return_components: bool = False) -> torch.Tensor | Dict[str, torch.Tensor]:
         coords_input = coords if coords is not None else self.reference_coords
         coords = _prepare_coords(coords_input, self.reference_coords)
+        with torch.no_grad():
+            self._refresh_nonbond_pairs(coords)
         energies: Dict[str, torch.Tensor] = {}
         energies["bond"] = self._bond_energy(coords)
         energies["angle"] = self._angle_energy(coords)
@@ -282,3 +335,45 @@ class UFFTorch(nn.Module):
         energy = vdw_depth * (r12 - 2.0 * r6)
         energy = energy.masked_fill(~valid, 0.0)
         return energy.sum() if coords.dim() == 2 else energy.sum(dim=-1)
+
+    def _refresh_nonbond_pairs(self, coords: torch.Tensor) -> None:
+        if self.nonbond_candidate_index.numel() == 0:
+            empty_index = torch.empty((0, 2), device=coords.device, dtype=torch.long)
+            empty_float = torch.empty((0,), device=coords.device, dtype=coords.dtype)
+            self.nonbond_index = empty_index
+            self.vdw_minimum = empty_float
+            self.vdw_well_depth = empty_float
+            self.vdw_threshold = empty_float
+            self.vdw_threshold_sq = empty_float
+            return
+        candidate_index = self.nonbond_candidate_index
+        candidate_min = self.nonbond_candidate_minimum
+        candidate_depth = self.nonbond_candidate_well_depth
+        candidate_threshold = self.nonbond_candidate_threshold
+        candidate_threshold_sq = self.nonbond_candidate_threshold_sq
+        diff = _pair_vectors(coords, candidate_index)
+        dist_sq = (diff * diff).sum(dim=-1)
+        if coords.dim() == 3:
+            positive = dist_sq > 0
+            threshold_sq = candidate_threshold_sq.unsqueeze(0)
+            within = dist_sq <= threshold_sq
+            valid = (positive & within).any(dim=0)
+        else:
+            positive = dist_sq > 0
+            within = dist_sq <= candidate_threshold_sq
+            valid = positive & within
+        if valid.any():
+            new_index = candidate_index[valid]
+            new_min = candidate_min[valid]
+            new_depth = candidate_depth[valid]
+            new_threshold = candidate_threshold[valid]
+        else:
+            new_index = candidate_index.new_empty((0, 2))
+            new_min = candidate_min.new_empty((0,))
+            new_depth = candidate_depth.new_empty((0,))
+            new_threshold = candidate_threshold.new_empty((0,))
+        self.nonbond_index = new_index
+        self.vdw_minimum = new_min
+        self.vdw_well_depth = new_depth
+        self.vdw_threshold = new_threshold
+        self.vdw_threshold_sq = new_threshold.square()
