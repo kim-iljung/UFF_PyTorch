@@ -52,6 +52,9 @@ class UFFInputs:
     vdw_well_depth: torch.Tensor
     vdw_threshold: torch.Tensor
     batch_coordinates: Optional[torch.Tensor] = None
+    fragment_ids: Optional[List[int]] = None
+    allow_interfragment_interactions: bool = True
+    vdw_distance_multiplier: float = 4.0
 
 
 def _as_tensor(data: Sequence[float], device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -348,6 +351,9 @@ def _build_single_inputs(
         vdw_minimum=_as_tensor(vdw_min, device, dtype),
         vdw_well_depth=_as_tensor(vdw_depth, device, dtype),
         vdw_threshold=_as_tensor(vdw_thresh, device, dtype),
+        fragment_ids=fragment_labels,
+        allow_interfragment_interactions=not ignore_interfragment_interactions,
+        vdw_distance_multiplier=vdw_distance_multiplier,
     )
 
 
@@ -518,6 +524,315 @@ def build_uff_inputs(
             vdw_minimum=reference.vdw_minimum,
             vdw_well_depth=reference.vdw_well_depth,
             vdw_threshold=reference.vdw_threshold,
+            fragment_ids=reference.fragment_ids,
+            allow_interfragment_interactions=reference.allow_interfragment_interactions,
+            vdw_distance_multiplier=reference.vdw_distance_multiplier,
         )
 
     raise TypeError("The ``mol`` argument must be an RDKit molecule or a sequence of them.")
+
+
+def merge_uff_inputs(
+    left: UFFInputs,
+    right: UFFInputs,
+    *,
+    ignore_interfragment_interactions: bool = False,
+    vdw_distance_multiplier: Optional[float] = None,
+) -> UFFInputs:
+    """Merge two :class:`UFFInputs` objects into a single system."""
+
+    device = left.coordinates.device
+    dtype = left.coordinates.dtype
+
+    right_coords = right.coordinates.to(device=device, dtype=dtype, non_blocking=True)
+    left_coords = left.coordinates.to(device=device, dtype=dtype, non_blocking=True)
+    coordinates = torch.cat([left_coords, right_coords], dim=0)
+
+    left_batch = left.batch_coordinates
+    right_batch = right.batch_coordinates
+    batch_size: Optional[int] = None
+    if left_batch is not None:
+        left_batch = left_batch.to(device=device, dtype=dtype, non_blocking=True)
+        batch_size = left_batch.shape[0]
+    if right_batch is not None:
+        right_batch = right_batch.to(device=device, dtype=dtype, non_blocking=True)
+        if batch_size is None:
+            batch_size = right_batch.shape[0]
+        elif batch_size != right_batch.shape[0]:
+            raise ValueError("UFFInputs instances use different batch sizes.")
+    if batch_size is not None:
+        if left_batch is None:
+            left_batch = left_coords.unsqueeze(0).repeat(batch_size, 1, 1)
+        if right_batch is None:
+            right_batch = right_coords.unsqueeze(0).repeat(batch_size, 1, 1)
+        batch_coordinates = torch.cat([left_batch, right_batch], dim=1)
+    else:
+        batch_coordinates = None
+
+    offset = left_coords.shape[0]
+
+    def _match_device(tensor: torch.Tensor, *, target_dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+        if target_dtype is None:
+            return tensor.to(device=device, non_blocking=True)
+        return tensor.to(device=device, dtype=target_dtype, non_blocking=True)
+
+    bond_index = torch.cat(
+        [
+            _match_device(left.bond_index),
+            _match_device(right.bond_index) + offset if right.bond_index.numel() else torch.empty((0, 2), device=device, dtype=torch.long),
+        ],
+        dim=0,
+    )
+    bond_rest_length = torch.cat(
+        [
+            _match_device(left.bond_rest_length, target_dtype=dtype),
+            _match_device(right.bond_rest_length, target_dtype=dtype),
+        ],
+        dim=0,
+    )
+    bond_force_constant = torch.cat(
+        [
+            _match_device(left.bond_force_constant, target_dtype=dtype),
+            _match_device(right.bond_force_constant, target_dtype=dtype),
+        ],
+        dim=0,
+    )
+
+    def _shift_and_cat(
+        left_tensor: torch.Tensor,
+        right_tensor: torch.Tensor,
+        width: int,
+    ) -> torch.Tensor:
+        parts: List[torch.Tensor] = []
+        if left_tensor.numel():
+            parts.append(_match_device(left_tensor))
+        if right_tensor.numel():
+            parts.append(_match_device(right_tensor) + offset)
+        if not parts:
+            return torch.empty((0, width), device=device, dtype=torch.long)
+        return torch.cat(parts, dim=0)
+
+    angle_index = _shift_and_cat(left.angle_index, right.angle_index, 3)
+    torsion_index = _shift_and_cat(left.torsion_index, right.torsion_index, 4)
+    inversion_index = _shift_and_cat(left.inversion_index, right.inversion_index, 4)
+    nonbond_index_existing = _shift_and_cat(left.nonbond_index, right.nonbond_index, 2)
+
+    angle_force_constant = torch.cat(
+        [
+            _match_device(left.angle_force_constant, target_dtype=dtype),
+            _match_device(right.angle_force_constant, target_dtype=dtype),
+        ],
+        dim=0,
+    )
+    angle_c0 = torch.cat(
+        [
+            _match_device(left.angle_c0, target_dtype=dtype),
+            _match_device(right.angle_c0, target_dtype=dtype),
+        ],
+        dim=0,
+    )
+    angle_c1 = torch.cat(
+        [
+            _match_device(left.angle_c1, target_dtype=dtype),
+            _match_device(right.angle_c1, target_dtype=dtype),
+        ],
+        dim=0,
+    )
+    angle_c2 = torch.cat(
+        [
+            _match_device(left.angle_c2, target_dtype=dtype),
+            _match_device(right.angle_c2, target_dtype=dtype),
+        ],
+        dim=0,
+    )
+    angle_order = torch.cat(
+        [
+            _match_device(left.angle_order),
+            _match_device(right.angle_order),
+        ],
+        dim=0,
+    )
+    torsion_force_constant = torch.cat(
+        [
+            _match_device(left.torsion_force_constant, target_dtype=dtype),
+            _match_device(right.torsion_force_constant, target_dtype=dtype),
+        ],
+        dim=0,
+    )
+    torsion_order = torch.cat(
+        [
+            _match_device(left.torsion_order),
+            _match_device(right.torsion_order),
+        ],
+        dim=0,
+    )
+    torsion_cos_term = torch.cat(
+        [
+            _match_device(left.torsion_cos_term, target_dtype=dtype),
+            _match_device(right.torsion_cos_term, target_dtype=dtype),
+        ],
+        dim=0,
+    )
+    inversion_force_constant = torch.cat(
+        [
+            _match_device(left.inversion_force_constant, target_dtype=dtype),
+            _match_device(right.inversion_force_constant, target_dtype=dtype),
+        ],
+        dim=0,
+    )
+    inversion_c0 = torch.cat(
+        [
+            _match_device(left.inversion_c0, target_dtype=dtype),
+            _match_device(right.inversion_c0, target_dtype=dtype),
+        ],
+        dim=0,
+    )
+    inversion_c1 = torch.cat(
+        [
+            _match_device(left.inversion_c1, target_dtype=dtype),
+            _match_device(right.inversion_c1, target_dtype=dtype),
+        ],
+        dim=0,
+    )
+    inversion_c2 = torch.cat(
+        [
+            _match_device(left.inversion_c2, target_dtype=dtype),
+            _match_device(right.inversion_c2, target_dtype=dtype),
+        ],
+        dim=0,
+    )
+
+    atom_types = list(left.atom_types) + list(right.atom_types)
+    atom_params = list(left.atom_params) + list(right.atom_params)
+
+    left_frag = list(left.fragment_ids) if left.fragment_ids is not None else [0] * left_coords.shape[0]
+    right_frag_src = (
+        list(right.fragment_ids) if right.fragment_ids is not None else [0] * right_coords.shape[0]
+    )
+    frag_offset = max(left_frag, default=-1) + 1 if left_frag else 0
+    right_frag = [frag + frag_offset for frag in right_frag_src]
+    fragment_ids = left_frag + right_frag
+
+    inferred_multipliers: List[float] = []
+    for entry in (left, right):
+        if hasattr(entry, "vdw_distance_multiplier") and entry.vdw_distance_multiplier is not None:
+            inferred_multipliers.append(float(entry.vdw_distance_multiplier))
+    if vdw_distance_multiplier is not None:
+        multiplier = float(vdw_distance_multiplier)
+    elif inferred_multipliers:
+        base = inferred_multipliers[0]
+        for value in inferred_multipliers[1:]:
+            if abs(value - base) > 1e-6:
+                raise ValueError("Input UFFInputs instances use incompatible van der Waals cutoffs.")
+        multiplier = base
+    else:
+        multiplier = 4.0
+
+    vdw_minimum_parts: List[torch.Tensor] = []
+    vdw_well_depth_parts: List[torch.Tensor] = []
+    vdw_threshold_parts: List[torch.Tensor] = []
+
+    if left.vdw_minimum.numel():
+        vdw_minimum_parts.append(_match_device(left.vdw_minimum, target_dtype=dtype))
+        vdw_well_depth_parts.append(_match_device(left.vdw_well_depth, target_dtype=dtype))
+        vdw_threshold_parts.append(_match_device(left.vdw_threshold, target_dtype=dtype))
+    if right.vdw_minimum.numel():
+        vdw_minimum_parts.append(_match_device(right.vdw_minimum, target_dtype=dtype))
+        vdw_well_depth_parts.append(_match_device(right.vdw_well_depth, target_dtype=dtype))
+        vdw_threshold_parts.append(_match_device(right.vdw_threshold, target_dtype=dtype))
+
+    cross_index_parts: List[torch.Tensor] = []
+    cross_min_parts: List[torch.Tensor] = []
+    cross_depth_parts: List[torch.Tensor] = []
+    cross_thresh_parts: List[torch.Tensor] = []
+
+    if not ignore_interfragment_interactions:
+        cross_pairs: List[Tuple[int, int]] = []
+        cross_min: List[float] = []
+        cross_depth: List[float] = []
+        cross_thresh: List[float] = []
+        for idx_left, params_left in enumerate(atom_params[:offset]):
+            if params_left is None:
+                continue
+            pos_left = left_coords[idx_left]
+            for idx_right, params_right in enumerate(atom_params[offset:], start=0):
+                actual_params = params_right
+                if actual_params is None:
+                    continue
+                pos_right = right_coords[idx_right]
+                dist = torch.linalg.norm(pos_left - pos_right).item()
+                minimum = calc_nonbonded_minimum(params_left, actual_params)
+                threshold = multiplier * minimum
+                if dist <= threshold:
+                    cross_pairs.append((idx_left, offset + idx_right))
+                    cross_min.append(minimum)
+                    cross_depth.append(calc_nonbonded_depth(params_left, actual_params))
+                    cross_thresh.append(threshold)
+        if cross_pairs:
+            cross_index_parts.append(
+                torch.tensor(cross_pairs, device=device, dtype=torch.long)
+            )
+            cross_min_parts.append(torch.tensor(cross_min, device=device, dtype=dtype))
+            cross_depth_parts.append(torch.tensor(cross_depth, device=device, dtype=dtype))
+            cross_thresh_parts.append(torch.tensor(cross_thresh, device=device, dtype=dtype))
+
+    if cross_index_parts:
+        nonbond_index = (
+            torch.cat([nonbond_index_existing] + cross_index_parts, dim=0)
+            if nonbond_index_existing.numel()
+            else torch.cat(cross_index_parts, dim=0)
+        )
+    else:
+        nonbond_index = nonbond_index_existing
+
+    if cross_min_parts:
+        vdw_minimum_parts.extend(cross_min_parts)
+        vdw_well_depth_parts.extend(cross_depth_parts)
+        vdw_threshold_parts.extend(cross_thresh_parts)
+
+    if vdw_minimum_parts:
+        vdw_minimum = torch.cat(vdw_minimum_parts, dim=0)
+        vdw_well_depth = torch.cat(vdw_well_depth_parts, dim=0)
+        vdw_threshold = torch.cat(vdw_threshold_parts, dim=0)
+    else:
+        vdw_minimum = torch.empty((0,), device=device, dtype=dtype)
+        vdw_well_depth = torch.empty((0,), device=device, dtype=dtype)
+        vdw_threshold = torch.empty((0,), device=device, dtype=dtype)
+
+    allow_interfragment = (
+        left.allow_interfragment_interactions
+        and right.allow_interfragment_interactions
+        and not ignore_interfragment_interactions
+    )
+
+    return UFFInputs(
+        atom_types=atom_types,
+        atom_params=atom_params,
+        coordinates=coordinates,
+        batch_coordinates=batch_coordinates,
+        bond_index=bond_index,
+        bond_rest_length=bond_rest_length,
+        bond_force_constant=bond_force_constant,
+        angle_index=angle_index,
+        angle_force_constant=angle_force_constant,
+        angle_c0=angle_c0,
+        angle_c1=angle_c1,
+        angle_c2=angle_c2,
+        angle_order=angle_order,
+        torsion_index=torsion_index,
+        torsion_force_constant=torsion_force_constant,
+        torsion_order=torsion_order,
+        torsion_cos_term=torsion_cos_term,
+        inversion_index=inversion_index,
+        inversion_force_constant=inversion_force_constant,
+        inversion_c0=inversion_c0,
+        inversion_c1=inversion_c1,
+        inversion_c2=inversion_c2,
+        nonbond_index=nonbond_index,
+        vdw_minimum=vdw_minimum,
+        vdw_well_depth=vdw_well_depth,
+        vdw_threshold=vdw_threshold,
+        fragment_ids=fragment_ids,
+        allow_interfragment_interactions=allow_interfragment,
+        vdw_distance_multiplier=multiplier,
+    )
