@@ -148,8 +148,19 @@ class UFFTorch(nn.Module):
         self.register_buffer("nonbond_candidate_threshold", candidate_threshold)
         self.register_buffer("nonbond_candidate_threshold_sq", candidate_threshold_sq)
 
+        initial_coords: torch.Tensor
+        if inputs.batch_coordinates is not None:
+            batch_coords = inputs.batch_coordinates.to(
+                device=device,
+                dtype=dtype,
+                non_blocking=True,
+            )
+            base = self.reference_coords.detach().unsqueeze(0)
+            initial_coords = torch.cat([base, batch_coords], dim=0)
+        else:
+            initial_coords = self.reference_coords
         with torch.no_grad():
-            self._refresh_nonbond_pairs(self.reference_coords)
+            self._refresh_nonbond_pairs(initial_coords)
 
     def forward(self, coords: Optional[torch.Tensor] = None, *, return_components: bool = False) -> torch.Tensor | Dict[str, torch.Tensor]:
         coords_input = coords if coords is not None else self.reference_coords

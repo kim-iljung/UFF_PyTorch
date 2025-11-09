@@ -541,15 +541,33 @@ def merge_uff_inputs(
 ) -> UFFInputs:
     """Merge two :class:`UFFInputs` objects into a single system."""
 
-    if left.batch_coordinates is not None or right.batch_coordinates is not None:
-        raise ValueError("Merging batched UFFInputs instances is not supported.")
-
     device = left.coordinates.device
     dtype = left.coordinates.dtype
 
     right_coords = right.coordinates.to(device=device, dtype=dtype, non_blocking=True)
     left_coords = left.coordinates.to(device=device, dtype=dtype, non_blocking=True)
     coordinates = torch.cat([left_coords, right_coords], dim=0)
+
+    left_batch = left.batch_coordinates
+    right_batch = right.batch_coordinates
+    batch_size: Optional[int] = None
+    if left_batch is not None:
+        left_batch = left_batch.to(device=device, dtype=dtype, non_blocking=True)
+        batch_size = left_batch.shape[0]
+    if right_batch is not None:
+        right_batch = right_batch.to(device=device, dtype=dtype, non_blocking=True)
+        if batch_size is None:
+            batch_size = right_batch.shape[0]
+        elif batch_size != right_batch.shape[0]:
+            raise ValueError("UFFInputs instances use different batch sizes.")
+    if batch_size is not None:
+        if left_batch is None:
+            left_batch = left_coords.unsqueeze(0).repeat(batch_size, 1, 1)
+        if right_batch is None:
+            right_batch = right_coords.unsqueeze(0).repeat(batch_size, 1, 1)
+        batch_coordinates = torch.cat([left_batch, right_batch], dim=1)
+    else:
+        batch_coordinates = None
 
     offset = left_coords.shape[0]
 
@@ -791,6 +809,7 @@ def merge_uff_inputs(
         atom_types=atom_types,
         atom_params=atom_params,
         coordinates=coordinates,
+        batch_coordinates=batch_coordinates,
         bond_index=bond_index,
         bond_rest_length=bond_rest_length,
         bond_force_constant=bond_force_constant,
