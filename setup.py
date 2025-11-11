@@ -68,6 +68,9 @@ def _rdkit_include_dirs() -> list[str]:
             base / "External",
             base / "share" / "RDKit",
             base / "share" / "RDKit" / "Code",
+            base / "share" / "RDKit" / "rdkit",
+            base / "share" / "RDKit" / "Include",
+            base / "share" / "RDKit" / "Include" / "rdkit",
         ]
         for candidate in candidates:
             _maybe_add(candidate, include_dirs, seen)
