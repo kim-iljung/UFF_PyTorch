@@ -9,6 +9,7 @@ from setuptools import Extension, setup
 
 try:
     import rdkit  # type: ignore
+    from rdkit import RDConfig  # type: ignore
 except ImportError as exc:  # pragma: no cover - build-time guard
     raise RuntimeError(
         "RDKit must be installed before building uff-torch extensions"
@@ -41,23 +42,71 @@ def _find_library(name: str, lib_dirs: list[Path]) -> tuple[str, Path]:
 
 
 def _rdkit_include_dirs() -> list[str]:
-    include_env = os.environ.get("RDKIT_INCLUDE_DIR")
     include_dirs: list[str] = []
+    seen: set[str] = set()
+
+    include_env = os.environ.get("RDKIT_INCLUDE_DIR")
     if include_env:
-        path = Path(include_env)
-        if path.is_dir():
-            include_dirs.append(str(path))
-    wheel_candidate = Path(rdkit.__file__).resolve().parent / "include"
-    if wheel_candidate.is_dir():
-        include_dirs.append(str(wheel_candidate))
+        for entry in include_env.split(os.pathsep):
+            if not entry:
+                continue
+            path = Path(entry)
+            if path.is_dir():
+                resolved = str(path)
+                if resolved not in seen:
+                    include_dirs.append(resolved)
+                    seen.add(resolved)
+
+    base = Path(rdkit.__file__).resolve().parent
+    wheel_candidates = [
+        base / "include",
+        base.parent / "include",
+        base.parent / "rdkit" / "include",
+    ]
+    for candidate in wheel_candidates:
+        if candidate.is_dir():
+            resolved = str(candidate)
+            if resolved not in seen:
+                include_dirs.append(resolved)
+                seen.add(resolved)
+
+    rdconfig_candidates: list[Path] = []
+    rd_base = Path(getattr(RDConfig, "RDBaseDir", ""))
+    if rd_base.is_dir():
+        rdconfig_candidates.extend(
+            [
+                rd_base,
+                rd_base / "Code",
+                rd_base / "External",
+            ]
+        )
+    rd_inc = Path(getattr(RDConfig, "RDIncDir", ""))
+    if rd_inc.is_dir():
+        rdconfig_candidates.append(rd_inc)
+    rd_code = Path(getattr(RDConfig, "RDCodeDir", ""))
+    if rd_code.is_dir():
+        rdconfig_candidates.append(rd_code)
+
+    for candidate in rdconfig_candidates:
+        if candidate.is_dir():
+            resolved = str(candidate)
+            if resolved not in seen:
+                include_dirs.append(resolved)
+                seen.add(resolved)
+
     system_candidate = Path("/usr/include/rdkit")
     if system_candidate.is_dir():
-        include_dirs.append(str(system_candidate))
+        resolved = str(system_candidate)
+        if resolved not in seen:
+            include_dirs.append(resolved)
+            seen.add(resolved)
+
     if not include_dirs:
         raise RuntimeError(
             "Could not determine RDKit include directories."
             " Set RDKIT_INCLUDE_DIR explicitly."
         )
+
     return include_dirs
 
 
