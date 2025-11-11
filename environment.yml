@@ -1,0 +1,27 @@
+name: diffalign
+channels:
+  - conda-forge
+  - pytorch
+  - nvidia
+  - defaults
+dependencies:
+  - python=3.10
+  - pytorch=2.2.1
+  - pytorch-cuda=12.1
+  - numpy=1.26.4
+  - scipy=1.13.1
+  - scikit-learn=1.5.2
+  - py3dmol=2.3.0
+  - ipykernel
+  - networkx
+  - easydict
+  - rdkit=2024.09.4
+  - libboost-headers=1.86.0
+  - pip
+  - pip:
+      - --find-links=https://data.pyg.org/whl/torch-2.2.1+cu121.html
+      - torch-geometric
+      - pyg_lib
+      - torch_scatter
+      - torch_sparse
+      - torch_cluster

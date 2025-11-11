@@ -114,6 +114,54 @@ def _maybe_add(path: Path, dest: list[str], seen: set[str]) -> None:
             seen.add(resolved)
 
 
+def _parse_env_paths(*names: str) -> list[Path]:
+    """Return directories from environment variables that may hold Boost headers."""
+
+    paths: list[Path] = []
+    for name in names:
+        raw = os.environ.get(name)
+        if not raw:
+            continue
+        for entry in raw.split(os.pathsep):
+            if not entry:
+                continue
+            candidate = Path(entry)
+            if candidate.is_dir():
+                paths.append(candidate)
+    return paths
+
+
+def _yield_boost_roots(base: Path) -> list[Path]:
+    """Collect plausible include roots beneath *base* containing boost/python.hpp."""
+
+    candidates: list[Path] = []
+
+    def add_if_header(root: Path) -> None:
+        header = root / "boost" / "python.hpp"
+        if header.is_file():
+            candidates.append(root)
+
+    add_if_header(base)
+
+    for pattern in ("boost", "boost-*", "boost_*", "boost.*"):
+        for candidate in base.glob(pattern):
+            if not candidate.is_dir():
+                continue
+            if candidate.name == "boost":
+                add_if_header(candidate.parent)
+                continue
+            if (candidate / "boost" / "python.hpp").is_file():
+                candidates.append(candidate)
+
+    direct = base / "python.hpp"
+    if direct.is_file() and base.name == "boost":
+        parent = base.parent
+        if parent.is_dir():
+            candidates.append(parent)
+
+    return candidates
+
+
 def _boost_include_dirs(existing: list[str], lib_dirs: list[Path]) -> list[str]:
     """Augment *existing* include directories with Boost headers if needed."""
 
@@ -124,19 +172,16 @@ def _boost_include_dirs(existing: list[str], lib_dirs: list[Path]) -> list[str]:
         return existing
 
     include_dirs = list(existing)
-    seen = set(include_dirs)
+    seen: set[str] = set(include_dirs)
 
-    env_dirs = os.environ.get("BOOST_INCLUDEDIR", "")
-    if env_dirs:
-        for entry in env_dirs.split(os.pathsep):
-            if entry:
-                _maybe_add(Path(entry), include_dirs, seen)
-
-    boost_root = os.environ.get("BOOST_ROOT")
-    if boost_root:
-        root = Path(boost_root)
-        _maybe_add(root / "include", include_dirs, seen)
-        _maybe_add(root / "include" / "boost", include_dirs, seen)
+    for env_path in _parse_env_paths(
+        "BOOST_INCLUDEDIR",
+        "BOOST_ROOT",
+        "BOOSTROOT",
+        "BOOST_HOME",
+    ):
+        _maybe_add(env_path, include_dirs, seen)
+        _maybe_add(env_path / "include", include_dirs, seen)
 
     rdconfig_candidates = [
         Path(getattr(RDConfig, "boostIncludeDir", "")),
@@ -157,11 +202,19 @@ def _boost_include_dirs(existing: list[str], lib_dirs: list[Path]) -> list[str]:
         if not prefix:
             continue
         _maybe_add(prefix / "include", include_dirs, seen)
-        _maybe_add(prefix / "include" / "boost", include_dirs, seen)
 
     for lib_dir in lib_dirs:
         _maybe_add(lib_dir.parent / "include", include_dirs, seen)
         _maybe_add(lib_dir.parent / "include" / "boost", include_dirs, seen)
+
+    if not any(has_boost_header(path) for path in include_dirs):
+        expanded = list(include_dirs)
+        for entry in expanded:
+            base = Path(entry)
+            if not base.is_dir():
+                continue
+            for candidate in _yield_boost_roots(base):
+                _maybe_add(candidate, include_dirs, seen)
 
     if not any(has_boost_header(path) for path in include_dirs):
         raise RuntimeError(
