@@ -41,65 +41,100 @@ def _find_library(name: str, lib_dirs: list[Path]) -> tuple[str, Path]:
     raise RuntimeError(f"Could not locate the RDKit library '{name}'")
 
 
+def _resolved(path: Path) -> Path:
+    """Best-effort resolve of *path* without failing."""
+
+    try:
+        return path.resolve()
+    except OSError:
+        return path
+
+
 def _rdkit_include_dirs() -> list[str]:
     include_dirs: list[str] = []
     seen: set[str] = set()
 
+    def add_with_variants(base: Path) -> None:
+        if not base:
+            return
+        candidates = [
+            base,
+            base / "include",
+            base / "include" / "rdkit",
+            base / "Library" / "include",
+            base / "Library" / "include" / "rdkit",
+            base / "rdkit",
+            base / "Code",
+            base / "External",
+            base / "share" / "RDKit",
+            base / "share" / "RDKit" / "Code",
+        ]
+        for candidate in candidates:
+            _maybe_add(candidate, include_dirs, seen)
+
     include_env = os.environ.get("RDKIT_INCLUDE_DIR")
     if include_env:
         for entry in include_env.split(os.pathsep):
-            if not entry:
-                continue
-            path = Path(entry)
-            if path.is_dir():
-                resolved = str(path)
-                if resolved not in seen:
-                    include_dirs.append(resolved)
-                    seen.add(resolved)
+            if entry:
+                _maybe_add(Path(entry), include_dirs, seen)
 
-    base = Path(rdkit.__file__).resolve().parent
-    wheel_candidates = [
-        base / "include",
-        base.parent / "include",
-        base.parent / "rdkit" / "include",
+    rdmodule_path = _resolved(Path(rdkit.__file__)).parent
+    add_with_variants(rdmodule_path)
+    add_with_variants(rdmodule_path.parent)
+
+    rdconfig_candidates = [
+        Path(getattr(RDConfig, "RDBaseDir", "")),
+        Path(getattr(RDConfig, "RDCodeDir", "")),
+        Path(getattr(RDConfig, "RDIncDir", "")),
+        Path(getattr(RDConfig, "RDBoostDir", "")),
     ]
-    for candidate in wheel_candidates:
-        if candidate.is_dir():
-            resolved = str(candidate)
-            if resolved not in seen:
-                include_dirs.append(resolved)
-                seen.add(resolved)
-
-    rdconfig_candidates: list[Path] = []
-    rd_base = Path(getattr(RDConfig, "RDBaseDir", ""))
-    if rd_base.is_dir():
-        rdconfig_candidates.extend(
-            [
-                rd_base,
-                rd_base / "Code",
-                rd_base / "External",
-            ]
-        )
-    rd_inc = Path(getattr(RDConfig, "RDIncDir", ""))
-    if rd_inc.is_dir():
-        rdconfig_candidates.append(rd_inc)
-    rd_code = Path(getattr(RDConfig, "RDCodeDir", ""))
-    if rd_code.is_dir():
-        rdconfig_candidates.append(rd_code)
-
     for candidate in rdconfig_candidates:
-        if candidate.is_dir():
-            resolved = str(candidate)
-            if resolved not in seen:
-                include_dirs.append(resolved)
-                seen.add(resolved)
+        add_with_variants(candidate)
 
-    system_candidate = Path("/usr/include/rdkit")
-    if system_candidate.is_dir():
-        resolved = str(system_candidate)
-        if resolved not in seen:
-            include_dirs.append(resolved)
-            seen.add(resolved)
+    prefix_values = [
+        sys.prefix,
+        sys.exec_prefix,
+        getattr(sys, "base_prefix", ""),
+        getattr(sys, "base_exec_prefix", ""),
+        os.environ.get("CONDA_PREFIX", ""),
+        os.environ.get("VIRTUAL_ENV", ""),
+    ]
+    prefixes = {Path(value) for value in prefix_values if value}
+    for prefix in prefixes:
+        add_with_variants(prefix)
+
+    system_candidates = [
+        Path("/usr/include/rdkit"),
+        Path("/usr/local/include/rdkit"),
+        Path("/opt/homebrew/include/rdkit"),
+    ]
+    for candidate in system_candidates:
+        _maybe_add(candidate, include_dirs, seen)
+
+    target_header = Path("GraphMol/ForceFieldHelpers/UFF/AtomTyper.h")
+    for directory in list(include_dirs):
+        path = Path(directory)
+        if (path / target_header).is_file():
+            break
+    else:
+        search_space = [Path(dir_path) for dir_path in include_dirs]
+        for base in list(search_space):
+            if not base.is_dir():
+                continue
+            candidate = base / "rdkit"
+            if (candidate / target_header).is_file():
+                _maybe_add(candidate, include_dirs, seen)
+                break
+            candidate = base / "Code"
+            if (candidate / target_header).is_file():
+                _maybe_add(candidate, include_dirs, seen)
+                break
+        else:
+            raise RuntimeError(
+                "Could not determine RDKit include directories containing"
+                " GraphMol/ForceFieldHelpers/UFF/AtomTyper.h."
+                " Set RDKIT_INCLUDE_DIR to the path exposing RDKit headers."
+            )
 
     return include_dirs
 
@@ -107,6 +142,7 @@ def _rdkit_include_dirs() -> list[str]:
 def _maybe_add(path: Path, dest: list[str], seen: set[str]) -> None:
     if not path:
         return
+    path = _resolved(path)
     if path.is_dir():
         resolved = str(path)
         if resolved not in seen:
