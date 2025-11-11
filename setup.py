@@ -72,8 +72,44 @@ required_libraries = [
     "RDKitDataStructs",
     "RDKitRDGeneral",
     "RDKitRDBoost",
-    "boost_python311",
 ]
+
+
+def _resolve_boost_python(lib_dirs: list[Path]) -> tuple[str, Path]:
+    """Find the boost_python runtime matching the current interpreter."""
+
+    candidates: list[str] = []
+    nodot = sysconfig.get_config_var("py_version_nodot")
+    if nodot:
+        candidates.append(f"boost_python{nodot}")
+    py_major = sys.version_info.major
+    py_minor = sys.version_info.minor
+    candidates.extend(
+        [
+            f"boost_python{py_major}{py_minor}",
+            f"boost_python{py_major}",
+            "boost_python3",
+            "boost_python",
+        ]
+    )
+
+    seen: set[str] = set()
+    for name in candidates:
+        if name in seen:
+            continue
+        seen.add(name)
+        try:
+            return _find_library(name, lib_dirs)
+        except RuntimeError:
+            continue
+
+    for lib_dir in lib_dirs:
+        matches = sorted(lib_dir.glob("libboost_python*.so*"))
+        if matches:
+            match = matches[0]
+            return f":{match.name}", lib_dir
+
+    raise RuntimeError("Could not locate a suitable boost_python library")
 
 lib_dirs = _candidate_lib_dirs()
 if not lib_dirs:
@@ -85,6 +121,10 @@ for lib in required_libraries:
     resolved, directory = _find_library(lib, lib_dirs)
     libraries.append(resolved)
     runtime_dirs.add(str(directory))
+
+boost_resolved, boost_dir = _resolve_boost_python(lib_dirs)
+libraries.append(boost_resolved)
+runtime_dirs.add(str(boost_dir))
 
 python_include = sysconfig.get_paths()["include"]
 include_dirs = [python_include, * _rdkit_include_dirs()]
