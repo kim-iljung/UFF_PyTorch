@@ -15,9 +15,6 @@ from .utils import (
     calc_bond_force_constant,
     calc_bond_rest_length,
     calc_inversion_coefficients_and_force_constant,
-    calc_nonbonded_depth,
-    calc_nonbonded_minimum,
-    neighbour_matrix,
     torsion_parameters,
 )
 
@@ -29,29 +26,43 @@ class UFFInputs:
     atom_types: List[str]
     atom_params: List[Optional[UFFAtomParameters]]
     coordinates: torch.Tensor
+
+    # Bonds
     bond_index: torch.Tensor
     bond_rest_length: torch.Tensor
     bond_force_constant: torch.Tensor
+
+    # Angles
     angle_index: torch.Tensor
     angle_force_constant: torch.Tensor
     angle_c0: torch.Tensor
     angle_c1: torch.Tensor
     angle_c2: torch.Tensor
     angle_order: torch.Tensor
+
+    # Torsions
     torsion_index: torch.Tensor
     torsion_force_constant: torch.Tensor
     torsion_order: torch.Tensor
     torsion_cos_term: torch.Tensor
+
+    # Inversions
     inversion_index: torch.Tensor
     inversion_force_constant: torch.Tensor
     inversion_c0: torch.Tensor
     inversion_c1: torch.Tensor
     inversion_c2: torch.Tensor
+
+    # Non-bonded (left empty here; model will populate from candidates)
     nonbond_index: torch.Tensor
     vdw_minimum: torch.Tensor
     vdw_well_depth: torch.Tensor
     vdw_threshold: torch.Tensor
+
+    # Batch coordinates (optional)
     batch_coordinates: Optional[torch.Tensor] = None
+
+    # Fragment info and VDW cutoff control for model-side candidate building
     fragment_ids: Optional[List[int]] = None
     allow_interfragment_interactions: bool = True
     vdw_distance_multiplier: float = 4.0
@@ -115,6 +126,7 @@ def _build_single_inputs(
     conf_id, conf = _ensure_conformer(mol, conf_id)
     atom_types, atom_params, _ = _compute_atom_types(mol)
 
+    # Coordinates
     coords = torch.tensor(
         [
             (
@@ -128,6 +140,7 @@ def _build_single_inputs(
         device=device,
     )
 
+    # Bonds
     bond_index: List[Tuple[int, int]] = []
     bond_rest: List[float] = []
     bond_force: List[float] = []
@@ -148,6 +161,7 @@ def _build_single_inputs(
         bond_rest.append(r0)
         bond_force.append(k)
 
+    # Angles
     angle_index: List[Tuple[int, int, int]] = []
     angle_force: List[float] = []
     angle_c0: List[float] = []
@@ -192,6 +206,7 @@ def _build_single_inputs(
                 angle_c2.append(c2)
                 angle_order.append(order_val)
 
+    # Torsions
     torsion_index: List[Tuple[int, int, int, int]] = []
     torsion_force: List[float] = []
     torsion_order: List[int] = []
@@ -245,6 +260,7 @@ def _build_single_inputs(
             torsion_order.append(order_val)
             torsion_cos.append(cos_term)
 
+    # Inversions
     inversion_index: List[Tuple[int, int, int, int]] = []
     inversion_force: List[float] = []
     inversion_c0: List[float] = []
@@ -283,44 +299,17 @@ def _build_single_inputs(
             inversion_c1.append(c1)
             inversion_c2.append(c2)
 
-    bonds = [(i, j) for i, j in bond_index]
-    relation = neighbour_matrix(mol.GetNumAtoms(), bonds)
-    nonbond_pairs: List[Tuple[int, int]] = []
-    vdw_min: List[float] = []
-    vdw_depth: List[float] = []
-    vdw_thresh: List[float] = []
+    # Fragment labels only (for model-side candidate masking). No pair building here.
     fragment_labels: Optional[List[int]] = None
     if ignore_interfragment_interactions:
         from rdkit.Chem import rdmolops
-
         frags = rdmolops.GetMolFrags(mol, asMols=False, sanitizeFrags=False)
         fragment_labels = [0] * mol.GetNumAtoms()
         for frag_id, atoms in enumerate(frags):
             for idx in atoms:
                 fragment_labels[idx] = frag_id
-    for i in range(mol.GetNumAtoms()):
-        params_i = atom_params[i]
-        if params_i is None:
-            continue
-        for j in range(i + 1, mol.GetNumAtoms()):
-            params_j = atom_params[j]
-            if params_j is None:
-                continue
-            if fragment_labels is not None and fragment_labels[i] != fragment_labels[j]:
-                continue
-            if relation[i][j] < 2:
-                continue
-            pos_i = conf.GetAtomPosition(i)
-            pos_j = conf.GetAtomPosition(j)
-            dist = (pos_i - pos_j).Length()
-            minimum = calc_nonbonded_minimum(params_i, params_j)
-            if dist > vdw_distance_multiplier * minimum:
-                continue
-            nonbond_pairs.append((i, j))
-            vdw_min.append(minimum)
-            vdw_depth.append(calc_nonbonded_depth(params_i, params_j))
-            vdw_thresh.append(vdw_distance_multiplier * minimum)
 
+    # Return with EMPTY non-bonded tensors; model will populate them from candidates.
     return UFFInputs(
         atom_types=atom_types,
         atom_params=atom_params,
@@ -347,10 +336,10 @@ def _build_single_inputs(
         inversion_c0=_as_tensor(inversion_c0, device, dtype),
         inversion_c1=_as_tensor(inversion_c1, device, dtype),
         inversion_c2=_as_tensor(inversion_c2, device, dtype),
-        nonbond_index=_as_index_tensor(nonbond_pairs, device, 2),
-        vdw_minimum=_as_tensor(vdw_min, device, dtype),
-        vdw_well_depth=_as_tensor(vdw_depth, device, dtype),
-        vdw_threshold=_as_tensor(vdw_thresh, device, dtype),
+        nonbond_index=torch.empty((0, 2), device=device, dtype=torch.long),
+        vdw_minimum=torch.empty((0,), device=device, dtype=dtype),
+        vdw_well_depth=torch.empty((0,), device=device, dtype=dtype),
+        vdw_threshold=torch.empty((0,), device=device, dtype=dtype),
         fragment_ids=fragment_labels,
         allow_interfragment_interactions=not ignore_interfragment_interactions,
         vdw_distance_multiplier=vdw_distance_multiplier,
@@ -520,10 +509,11 @@ def build_uff_inputs(
             inversion_c0=reference.inversion_c0,
             inversion_c1=reference.inversion_c1,
             inversion_c2=reference.inversion_c2,
-            nonbond_index=reference.nonbond_index,
-            vdw_minimum=reference.vdw_minimum,
-            vdw_well_depth=reference.vdw_well_depth,
-            vdw_threshold=reference.vdw_threshold,
+            # keep empty non-bonded
+            nonbond_index=reference.nonbond_index.new_empty((0, 2)),
+            vdw_minimum=reference.vdw_minimum.new_empty((0,)),
+            vdw_well_depth=reference.vdw_well_depth.new_empty((0,)),
+            vdw_threshold=reference.vdw_threshold.new_empty((0,)),
             fragment_ids=reference.fragment_ids,
             allow_interfragment_interactions=reference.allow_interfragment_interactions,
             vdw_distance_multiplier=reference.vdw_distance_multiplier,
@@ -615,7 +605,6 @@ def merge_uff_inputs(
     angle_index = _shift_and_cat(left.angle_index, right.angle_index, 3)
     torsion_index = _shift_and_cat(left.torsion_index, right.torsion_index, 4)
     inversion_index = _shift_and_cat(left.inversion_index, right.inversion_index, 4)
-    nonbond_index_existing = _shift_and_cat(left.nonbond_index, right.nonbond_index, 2)
 
     angle_force_constant = torch.cat(
         [
@@ -706,13 +695,12 @@ def merge_uff_inputs(
     atom_params = list(left.atom_params) + list(right.atom_params)
 
     left_frag = list(left.fragment_ids) if left.fragment_ids is not None else [0] * left_coords.shape[0]
-    right_frag_src = (
-        list(right.fragment_ids) if right.fragment_ids is not None else [0] * right_coords.shape[0]
-    )
+    right_frag_src = list(right.fragment_ids) if right.fragment_ids is not None else [0] * right_coords.shape[0]
     frag_offset = max(left_frag, default=-1) + 1 if left_frag else 0
     right_frag = [frag + frag_offset for frag in right_frag_src]
     fragment_ids = left_frag + right_frag
 
+    # Unify multiplier (keep same logic as before)
     inferred_multipliers: List[float] = []
     for entry in (left, right):
         if hasattr(entry, "vdw_distance_multiplier") and entry.vdw_distance_multiplier is not None:
@@ -728,82 +716,17 @@ def merge_uff_inputs(
     else:
         multiplier = 4.0
 
-    vdw_minimum_parts: List[torch.Tensor] = []
-    vdw_well_depth_parts: List[torch.Tensor] = []
-    vdw_threshold_parts: List[torch.Tensor] = []
-
-    if left.vdw_minimum.numel():
-        vdw_minimum_parts.append(_match_device(left.vdw_minimum, target_dtype=dtype))
-        vdw_well_depth_parts.append(_match_device(left.vdw_well_depth, target_dtype=dtype))
-        vdw_threshold_parts.append(_match_device(left.vdw_threshold, target_dtype=dtype))
-    if right.vdw_minimum.numel():
-        vdw_minimum_parts.append(_match_device(right.vdw_minimum, target_dtype=dtype))
-        vdw_well_depth_parts.append(_match_device(right.vdw_well_depth, target_dtype=dtype))
-        vdw_threshold_parts.append(_match_device(right.vdw_threshold, target_dtype=dtype))
-
-    cross_index_parts: List[torch.Tensor] = []
-    cross_min_parts: List[torch.Tensor] = []
-    cross_depth_parts: List[torch.Tensor] = []
-    cross_thresh_parts: List[torch.Tensor] = []
-
-    if not ignore_interfragment_interactions:
-        cross_pairs: List[Tuple[int, int]] = []
-        cross_min: List[float] = []
-        cross_depth: List[float] = []
-        cross_thresh: List[float] = []
-        for idx_left, params_left in enumerate(atom_params[:offset]):
-            if params_left is None:
-                continue
-            pos_left = left_coords[idx_left]
-            for idx_right, params_right in enumerate(atom_params[offset:], start=0):
-                actual_params = params_right
-                if actual_params is None:
-                    continue
-                pos_right = right_coords[idx_right]
-                dist = torch.linalg.norm(pos_left - pos_right).item()
-                minimum = calc_nonbonded_minimum(params_left, actual_params)
-                threshold = multiplier * minimum
-                if dist <= threshold:
-                    cross_pairs.append((idx_left, offset + idx_right))
-                    cross_min.append(minimum)
-                    cross_depth.append(calc_nonbonded_depth(params_left, actual_params))
-                    cross_thresh.append(threshold)
-        if cross_pairs:
-            cross_index_parts.append(
-                torch.tensor(cross_pairs, device=device, dtype=torch.long)
-            )
-            cross_min_parts.append(torch.tensor(cross_min, device=device, dtype=dtype))
-            cross_depth_parts.append(torch.tensor(cross_depth, device=device, dtype=dtype))
-            cross_thresh_parts.append(torch.tensor(cross_thresh, device=device, dtype=dtype))
-
-    if cross_index_parts:
-        nonbond_index = (
-            torch.cat([nonbond_index_existing] + cross_index_parts, dim=0)
-            if nonbond_index_existing.numel()
-            else torch.cat(cross_index_parts, dim=0)
-        )
-    else:
-        nonbond_index = nonbond_index_existing
-
-    if cross_min_parts:
-        vdw_minimum_parts.extend(cross_min_parts)
-        vdw_well_depth_parts.extend(cross_depth_parts)
-        vdw_threshold_parts.extend(cross_thresh_parts)
-
-    if vdw_minimum_parts:
-        vdw_minimum = torch.cat(vdw_minimum_parts, dim=0)
-        vdw_well_depth = torch.cat(vdw_well_depth_parts, dim=0)
-        vdw_threshold = torch.cat(vdw_threshold_parts, dim=0)
-    else:
-        vdw_minimum = torch.empty((0,), device=device, dtype=dtype)
-        vdw_well_depth = torch.empty((0,), device=device, dtype=dtype)
-        vdw_threshold = torch.empty((0,), device=device, dtype=dtype)
-
     allow_interfragment = (
         left.allow_interfragment_interactions
         and right.allow_interfragment_interactions
         and not ignore_interfragment_interactions
     )
+
+    # Non-bonded: keep EMPTY; model will derive from candidates on-the-fly.
+    nonbond_index = torch.empty((0, 2), device=device, dtype=torch.long)
+    vdw_minimum = torch.empty((0,), device=device, dtype=dtype)
+    vdw_well_depth = torch.empty((0,), device=device, dtype=dtype)
+    vdw_threshold = torch.empty((0,), device=device, dtype=dtype)
 
     return UFFInputs(
         atom_types=atom_types,
