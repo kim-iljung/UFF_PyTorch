@@ -1,17 +1,21 @@
-"""PyTorch module implementing the UFF energy expression."""
+"""PyTorch module implementing the UFF energy expression (radius_graph + torch_sparse fast-path)."""
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch import nn
+from torch_cluster import radius_graph  # REQUIRED
+from torch_sparse import SparseTensor
 
 from .builder import UFFInputs
-from .utils import calc_nonbonded_depth, calc_nonbonded_minimum, neighbour_matrix
 
+
+# ------------------------------ helpers ------------------------------
 
 def _prepare_coords(coords: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+    """Ensure coords is on reference's device/dtype and (N,3) or (B,N,3) contiguous."""
     if coords is reference:
         prepared = reference
     else:
@@ -32,24 +36,25 @@ def _prepare_coords(coords: torch.Tensor, reference: torch.Tensor) -> torch.Tens
 
 
 def _select_atoms(coords: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    """Slice coords by atom indices for either (N,3) or (B,N,3)."""
     if coords.dim() == 2:
         return torch.index_select(coords, 0, indices)
     return torch.index_select(coords, 1, indices)
 
 
 def _pair_vectors(coords: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+    """Return r_ij = r_i - r_j given pair index (P,2). Handles batched coords."""
     if index.numel() == 0:
-        return (
-            torch.empty((coords.shape[0], 0, 3), device=coords.device, dtype=coords.dtype)
-            if coords.dim() == 3
-            else torch.empty((0, 3), device=coords.device, dtype=coords.dtype)
-        )
+        if coords.dim() == 3:
+            return torch.empty((coords.shape[0], 0, 3), device=coords.device, dtype=coords.dtype)
+        return torch.empty((0, 3), device=coords.device, dtype=coords.dtype)
     first = _select_atoms(coords, index[:, 0])
     second = _select_atoms(coords, index[:, 1])
     return first - second
 
 
 def _gather(coords: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+    """Gather atom positions by index for either (N,3) or (B,N,3)."""
     if index.numel() == 0:
         shape = (coords.shape[0], 0, 3) if coords.dim() == 3 else (0, 3)
         return torch.empty(shape, device=coords.device, dtype=coords.dtype)
@@ -57,19 +62,58 @@ def _gather(coords: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
     return gathered.contiguous()
 
 
-class UFFTorch(nn.Module):
-    """Torch module wrapping the Universal Force Field energy."""
+def _extract_vdw_params(
+    atom_params: List[Optional[object]],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Extract per-atom VdW parameters (R*_i, D_i) from UFFAtomParameters list.
+    Returns: (valid_mask [N], R [N], D [N])
+    Tries common field names: vdw_minimum/r_vdw and vdw_well_depth/epsilon.
+    """
+    n = len(atom_params)
+    valid = torch.zeros(n, device=device, dtype=torch.bool)
+    R = torch.zeros(n, device=device, dtype=dtype)
+    D = torch.zeros(n, device=device, dtype=dtype)
+    for idx, p in enumerate(atom_params):
+        if p is None:
+            continue
+        r_i = getattr(p, "vdw_minimum", None)
+        if r_i is None:
+            r_i = getattr(p, "r_vdw", None)
+        d_i = getattr(p, "vdw_well_depth", None)
+        if d_i is None:
+            d_i = getattr(p, "epsilon", None)
+        if r_i is None or d_i is None:
+            continue
+        R[idx] = float(r_i)
+        D[idx] = float(d_i)
+        valid[idx] = True
+    return valid, R, D
 
-    def __init__(self, inputs: UFFInputs):
+
+# ------------------------------ main module ------------------------------
+
+
+class UFFTorch(nn.Module):
+    """Torch module wrapping the Universal Force Field energy (nonbond via radius_graph; fast 1–2/1–3 mask)."""
+
+    def __init__(self, inputs: UFFInputs, *, refresh_chunk_size: int = 8):
         super().__init__()
-        self.n_atoms = inputs.coordinates.shape[0]
+
+        # --- basic geometry & reference coords ---
+        self.n_atoms = int(inputs.coordinates.shape[0])
         self.reference_coords = nn.Parameter(
             inputs.coordinates.clone().detach(), requires_grad=True
         )
+
+        # --- bonded / angle / torsion / inversion buffers ---
         self.register_buffer("bond_index", inputs.bond_index)
         self.register_buffer("bond_rest_length", inputs.bond_rest_length)
         self.register_buffer("bond_force_constant", inputs.bond_force_constant)
         self.register_buffer("bond_half_force_constant", 0.5 * inputs.bond_force_constant)
+
         self.register_buffer("angle_index", inputs.angle_index)
         self.register_buffer("angle_force_constant", inputs.angle_force_constant)
         self.register_buffer("angle_c0", inputs.angle_c0)
@@ -82,91 +126,85 @@ class UFFTorch(nn.Module):
             if inputs.angle_order.numel()
             else inputs.angle_order.new_empty((0,), dtype=inputs.coordinates.dtype),
         )
+
         self.register_buffer("torsion_index", inputs.torsion_index)
         self.register_buffer("torsion_force_constant", inputs.torsion_force_constant)
         self.register_buffer("torsion_order", inputs.torsion_order)
         self.register_buffer("torsion_cos_term", inputs.torsion_cos_term)
-        self.register_buffer(
-            "torsion_half_force_constant",
-            0.5 * inputs.torsion_force_constant,
-        )
+        self.register_buffer("torsion_half_force_constant", 0.5 * inputs.torsion_force_constant)
+
         self.register_buffer("inversion_index", inputs.inversion_index)
         self.register_buffer("inversion_force_constant", inputs.inversion_force_constant)
         self.register_buffer("inversion_c0", inputs.inversion_c0)
         self.register_buffer("inversion_c1", inputs.inversion_c1)
         self.register_buffer("inversion_c2", inputs.inversion_c2)
-        self.register_buffer("nonbond_index", inputs.nonbond_index)
-        self.register_buffer("vdw_minimum", inputs.vdw_minimum)
-        self.register_buffer("vdw_well_depth", inputs.vdw_well_depth)
-        self.register_buffer("vdw_threshold", inputs.vdw_threshold)
-        self.register_buffer("vdw_threshold_sq", inputs.vdw_threshold.square())
 
+        # --- vdW settings & per-atom params ---
         self._vdw_distance_multiplier = float(inputs.vdw_distance_multiplier)
-        fragment_ids = inputs.fragment_ids
-        allow_interfragment = inputs.allow_interfragment_interactions
-        if inputs.bond_index.numel():
-            bonds = [(int(i), int(j)) for i, j in inputs.bond_index.detach().cpu().tolist()]
-        else:
-            bonds = []
-        relation = neighbour_matrix(self.n_atoms, bonds)
-        candidate_pairs: List[tuple[int, int]] = []
-        candidate_min: List[float] = []
-        candidate_depth: List[float] = []
-        for idx_i, params_i in enumerate(inputs.atom_params):
-            if params_i is None:
-                continue
-            for idx_j in range(idx_i + 1, self.n_atoms):
-                params_j = inputs.atom_params[idx_j]
-                if params_j is None:
-                    continue
-                if relation[idx_i][idx_j] < 2:
-                    continue
-                if (
-                    not allow_interfragment
-                    and fragment_ids is not None
-                    and fragment_ids[idx_i] != fragment_ids[idx_j]
-                ):
-                    continue
-                candidate_pairs.append((idx_i, idx_j))
-                candidate_min.append(calc_nonbonded_minimum(params_i, params_j))
-                candidate_depth.append(calc_nonbonded_depth(params_i, params_j))
         device = self.reference_coords.device
         dtype = self.reference_coords.dtype
-        if candidate_pairs:
-            candidate_index = torch.tensor(candidate_pairs, device=device, dtype=torch.long)
-            candidate_minimum = torch.tensor(candidate_min, device=device, dtype=dtype)
-            candidate_depth = torch.tensor(candidate_depth, device=device, dtype=dtype)
-        else:
-            candidate_index = torch.empty((0, 2), device=device, dtype=torch.long)
-            candidate_minimum = torch.empty((0,), device=device, dtype=dtype)
-            candidate_depth = torch.empty((0,), device=device, dtype=dtype)
-        candidate_threshold = candidate_minimum * self._vdw_distance_multiplier
-        candidate_threshold_sq = candidate_threshold.square()
-        self.register_buffer("nonbond_candidate_index", candidate_index)
-        self.register_buffer("nonbond_candidate_minimum", candidate_minimum)
-        self.register_buffer("nonbond_candidate_well_depth", candidate_depth)
-        self.register_buffer("nonbond_candidate_threshold", candidate_threshold)
-        self.register_buffer("nonbond_candidate_threshold_sq", candidate_threshold_sq)
 
-        initial_coords: torch.Tensor
-        if inputs.batch_coordinates is not None:
-            batch_coords = inputs.batch_coordinates.to(
-                device=device,
-                dtype=dtype,
-                non_blocking=True,
+        if inputs.fragment_ids is not None:
+            self.register_buffer(
+                "_fragment_ids",
+                torch.tensor(inputs.fragment_ids, device=device, dtype=torch.long),
+                persistent=False,
             )
-            base = self.reference_coords.detach().unsqueeze(0)
-            initial_coords = torch.cat([base, batch_coords], dim=0)
         else:
-            initial_coords = self.reference_coords
+            self._fragment_ids = None  # type: ignore[assignment]
+        self._allow_interfragment = bool(inputs.allow_interfragment_interactions)
+
+        valid_mask, atom_R, atom_D = _extract_vdw_params(inputs.atom_params, device, dtype)
+        self.register_buffer("vdw_atom_valid", valid_mask)
+        self.register_buffer("vdw_atom_R", atom_R)
+        self.register_buffer("vdw_atom_D", atom_D)
+
+        # tuning for batched refresh
+        self.refresh_chunk_size = int(refresh_chunk_size)
+
+        # --- build candidate nonbond pairs using optimized path ---
+        cand_index, cand_Rij, cand_Dij, cand_cutoff = self._build_nonbond_candidates(
+            coords=inputs.coordinates.to(device=device, dtype=dtype),
+            bond_index=inputs.bond_index,
+        )
+
+        # register candidate buffers
+        self.register_buffer("nonbond_candidate_index", cand_index)                   # (P,2)
+        self.register_buffer("nonbond_candidate_minimum", cand_Rij)                   # (P,)
+        self.register_buffer("nonbond_candidate_well_depth", cand_Dij)                # (P,)
+        self.register_buffer("nonbond_candidate_threshold", cand_cutoff)              # (P,)
+        self.register_buffer("nonbond_candidate_threshold_sq", cand_cutoff.square())  # (P,)
+
+        # --- current active nonbond buffers (populated by _refresh_nonbond_pairs) ---
+        self.register_buffer("nonbond_index", torch.empty((0, 2), device=device, dtype=torch.long))
+        self.register_buffer("vdw_minimum", torch.empty((0,), device=device, dtype=dtype))
+        self.register_buffer("vdw_well_depth", torch.empty((0,), device=device, dtype=dtype))
+        self.register_buffer("vdw_threshold", torch.empty((0,), device=device, dtype=dtype))
+        self.register_buffer("vdw_threshold_sq", torch.empty((0,), device=device, dtype=dtype))
+
+        # --- initialize nonbond list from initial coords (reference + optional batch) ---
+        if inputs.batch_coordinates is not None:
+            batch_coords = inputs.batch_coordinates.to(device=device, dtype=dtype, non_blocking=True)
+            base = self.reference_coords.detach().unsqueeze(0)  # (1,N,3)
+            initial_coords = torch.cat([base, batch_coords], dim=0)  # (B',N,3)
+        else:
+            initial_coords = self.reference_coords  # (N,3)
         with torch.no_grad():
             self._refresh_nonbond_pairs(initial_coords)
 
-    def forward(self, coords: Optional[torch.Tensor] = None, *, return_components: bool = False) -> torch.Tensor | Dict[str, torch.Tensor]:
+    # -------------------------- public API --------------------------
+
+    def forward(
+        self,
+        coords: Optional[torch.Tensor] = None,
+        *,
+        return_components: bool = False,
+    ) -> torch.Tensor | Dict[str, torch.Tensor]:
         coords_input = coords if coords is not None else self.reference_coords
         coords = _prepare_coords(coords_input, self.reference_coords)
         with torch.no_grad():
             self._refresh_nonbond_pairs(coords)
+
         energies: Dict[str, torch.Tensor] = {}
         energies["bond"] = self._bond_energy(coords)
         energies["angle"] = self._angle_energy(coords)
@@ -179,11 +217,13 @@ class UFFTorch(nn.Module):
             return energies
         return total
 
+    # -------------------------- energy terms --------------------------
+
     def _bond_energy(self, coords: torch.Tensor) -> torch.Tensor:
         if self.bond_index.numel() == 0:
             return torch.zeros((), device=coords.device, dtype=coords.dtype)
-        diff = _pair_vectors(coords, self.bond_index)
-        dist = torch.linalg.norm(diff, dim=-1)
+        diff = _pair_vectors(coords, self.bond_index)   # (..., Pbond, 3)
+        dist = torch.linalg.norm(diff, dim=-1)          # (..., Pbond)
         stretch = dist - self.bond_rest_length
         energy = self.bond_half_force_constant * torch.square(stretch)
         return energy.sum() if coords.dim() == 2 else energy.sum(dim=-1)
@@ -191,9 +231,11 @@ class UFFTorch(nn.Module):
     def _angle_energy(self, coords: torch.Tensor) -> torch.Tensor:
         if self.angle_index.numel() == 0:
             return torch.zeros((), device=coords.device, dtype=coords.dtype)
+
         p1 = _gather(coords, self.angle_index[:, 0])
         p2 = _gather(coords, self.angle_index[:, 1])
         p3 = _gather(coords, self.angle_index[:, 2])
+
         v1 = p1 - p2
         v2 = p3 - p2
         dot = (v1 * v2).sum(dim=-1)
@@ -201,10 +243,14 @@ class UFFTorch(nn.Module):
         d2_sq = (v2 * v2).sum(dim=-1)
         inv_denom = torch.rsqrt((d1_sq * d2_sq).clamp_min(1e-24))
         cos_theta = torch.clamp(dot * inv_denom, -0.999999, 0.999999)
+
         cos_sq = torch.square(cos_theta)
         sin_sq = torch.clamp(1.0 - cos_sq, min=1e-12)
         cos2 = cos_sq - sin_sq
+
         energy_term = self.angle_c0 + self.angle_c1 * cos_theta + self.angle_c2 * cos2
+
+        # special order handling (sp, sp2, sp3, ...)
         if self.angle_order.numel() and (self.angle_order > 0).any():
             order_long = self.angle_order
             order_float = self.angle_order_float
@@ -214,6 +260,7 @@ class UFFTorch(nn.Module):
             else:
                 order_long = order_long.expand_as(cos_theta)
                 order_float = order_float.expand_as(cos_theta)
+
             mask = order_long > 0
             if mask.any():
                 terms = torch.zeros_like(cos_theta)
@@ -234,16 +281,19 @@ class UFFTorch(nn.Module):
                 denom = torch.clamp(order_float * order_float, min=1.0)
                 replacement = (1.0 - terms) / denom
                 energy_term = torch.where(mask, replacement, energy_term)
+
         energy = self.angle_force_constant * energy_term
         return energy.sum() if coords.dim() == 2 else energy.sum(dim=-1)
 
     def _torsion_energy(self, coords: torch.Tensor) -> torch.Tensor:
         if self.torsion_index.numel() == 0:
             return torch.zeros((), device=coords.device, dtype=coords.dtype)
+
         p1 = _gather(coords, self.torsion_index[:, 0])
         p2 = _gather(coords, self.torsion_index[:, 1])
         p3 = _gather(coords, self.torsion_index[:, 2])
         p4 = _gather(coords, self.torsion_index[:, 3])
+
         r1 = p1 - p2
         r2 = p3 - p2
         r3 = p2 - p3
@@ -254,11 +304,14 @@ class UFFTorch(nn.Module):
         d2_sq = (t2 * t2).sum(dim=-1)
         inv_denom = torch.rsqrt((d1_sq * d2_sq).clamp_min(1e-24))
         cos_phi = torch.clamp((t1 * t2).sum(dim=-1) * inv_denom, -0.999999, 0.999999)
+
         cos_sq = torch.square(cos_phi)
-        sin_sq = torch.clamp(1.0 - cos_sq, min=1e-12)
+        sin_sq = torch.clamp(1.0 - cos_sq, min=1.0e-12)
+
         order = self.torsion_order
         if coords.dim() == 3:
             order = order.unsqueeze(0).expand_as(cos_phi)
+
         cos_n_phi = torch.zeros_like(cos_phi)
         if (order == 1).any():
             cos_n_phi = torch.where(order == 1, cos_phi, cos_n_phi)
@@ -266,9 +319,7 @@ class UFFTorch(nn.Module):
             cos_n_phi = torch.where(order == 2, 1.0 - 2.0 * sin_sq, cos_n_phi)
         if (order == 3).any():
             cos_n_phi = torch.where(
-                order == 3,
-                cos_phi * (cos_sq - 3.0 * sin_sq),
-                cos_n_phi,
+                order == 3, cos_phi * (cos_sq - 3.0 * sin_sq), cos_n_phi
             )
         if (order == 4).any():
             sin_sq_sq = torch.square(sin_sq)
@@ -284,39 +335,49 @@ class UFFTorch(nn.Module):
                 1.0 + sin_sq * (-32.0 * sin_sq * sin_sq + 48.0 * sin_sq - 18.0),
                 cos_n_phi,
             )
+
         energy = self.torsion_half_force_constant * (1.0 - self.torsion_cos_term * cos_n_phi)
         return energy.sum() if coords.dim() == 2 else energy.sum(dim=-1)
 
     def _inversion_energy(self, coords: torch.Tensor) -> torch.Tensor:
         if self.inversion_index.numel() == 0:
             return torch.zeros((), device=coords.device, dtype=coords.dtype)
+
         i = self.inversion_index[:, 0]
         j = self.inversion_index[:, 1]
         k = self.inversion_index[:, 2]
         l = self.inversion_index[:, 3]
+
         p_i = _gather(coords, i)
         p_j = _gather(coords, j)
         p_k = _gather(coords, k)
         p_l = _gather(coords, l)
+
         r_ji = p_i - p_j
         r_jk = p_k - p_j
         r_jl = p_l - p_j
+
         d_ji = torch.linalg.norm(r_ji, dim=-1)
         d_jk = torch.linalg.norm(r_jk, dim=-1)
         d_jl = torch.linalg.norm(r_jl, dim=-1)
+
         mask = (d_ji > 1e-8) & (d_jk > 1e-8) & (d_jl > 1e-8)
         safe = mask.to(dtype=coords.dtype)
+
         r_ji = r_ji / torch.clamp(d_ji.unsqueeze(-1), min=1e-8)
         r_jk = r_jk / torch.clamp(d_jk.unsqueeze(-1), min=1e-8)
         r_jl = r_jl / torch.clamp(d_jl.unsqueeze(-1), min=1e-8)
+
         n = torch.cross(-r_ji, r_jk, dim=-1)
         n_norm = torch.linalg.norm(n, dim=-1)
         n = n / torch.clamp(n_norm.unsqueeze(-1), min=1e-8)
+
         cos_y = torch.clamp((n * r_jl).sum(dim=-1), -0.999999, 0.999999)
         cos_y_sq = torch.square(cos_y)
         sin_y = torch.sqrt(torch.clamp(1.0 - cos_y_sq, min=1e-12))
         sin_y_sq = torch.square(sin_y)
         cos_2w = 2.0 * sin_y_sq - 1.0
+
         energy = self.inversion_force_constant * (
             self.inversion_c0 + self.inversion_c1 * sin_y + self.inversion_c2 * cos_2w
         )
@@ -326,9 +387,11 @@ class UFFTorch(nn.Module):
     def _nonbonded_energy(self, coords: torch.Tensor) -> torch.Tensor:
         if self.nonbond_index.numel() == 0:
             return torch.zeros((), device=coords.device, dtype=coords.dtype)
-        diff = _pair_vectors(coords, self.nonbond_index)
-        dist_sq = (diff * diff).sum(dim=-1)
+
+        diff = _pair_vectors(coords, self.nonbond_index)        # (..., Pnb, 3)
+        dist_sq = (diff * diff).sum(dim=-1)                     # (..., Pnb)
         inv_dist = torch.rsqrt(dist_sq.clamp_min(1e-12))
+
         if coords.dim() == 2:
             thresh_sq = self.vdw_threshold_sq
             vdw_min = self.vdw_minimum
@@ -337,7 +400,10 @@ class UFFTorch(nn.Module):
             thresh_sq = self.vdw_threshold_sq.unsqueeze(0)
             vdw_min = self.vdw_minimum.unsqueeze(0)
             vdw_depth = self.vdw_well_depth.unsqueeze(0)
+
         valid = (dist_sq > 0) & (dist_sq <= thresh_sq)
+
+        # Lennard-Jones 12-6 using UFF mixing: E = D_ij [ (Rij/r)^12 - 2 (Rij/r)^6 ]
         r = vdw_min * inv_dist
         r2 = torch.square(r)
         r4 = torch.square(r2)
@@ -345,9 +411,17 @@ class UFFTorch(nn.Module):
         r12 = torch.square(r6)
         energy = vdw_depth * (r12 - 2.0 * r6)
         energy = energy.masked_fill(~valid, 0.0)
+
         return energy.sum() if coords.dim() == 2 else energy.sum(dim=-1)
 
+    # -------------------------- dynamic activation --------------------------
+
     def _refresh_nonbond_pairs(self, coords: torch.Tensor) -> None:
+        """
+        Activate a subset of candidate pairs based on current coords:
+        keep pairs with any-batch distance <= pair-specific cutoff and > 0.
+        Chunked across batch to reduce memory (step 5).
+        """
         if self.nonbond_candidate_index.numel() == 0:
             empty_index = torch.empty((0, 2), device=coords.device, dtype=torch.long)
             empty_float = torch.empty((0,), device=coords.device, dtype=coords.dtype)
@@ -357,34 +431,188 @@ class UFFTorch(nn.Module):
             self.vdw_threshold = empty_float
             self.vdw_threshold_sq = empty_float
             return
-        candidate_index = self.nonbond_candidate_index
-        candidate_min = self.nonbond_candidate_minimum
-        candidate_depth = self.nonbond_candidate_well_depth
-        candidate_threshold = self.nonbond_candidate_threshold
-        candidate_threshold_sq = self.nonbond_candidate_threshold_sq
-        diff = _pair_vectors(coords, candidate_index)
-        dist_sq = (diff * diff).sum(dim=-1)
+
+        cand_index = self.nonbond_candidate_index
+        cand_min = self.nonbond_candidate_minimum
+        cand_depth = self.nonbond_candidate_well_depth
+        cand_thresh = self.nonbond_candidate_threshold
+        cand_thresh_sq = self.nonbond_candidate_threshold_sq
+
+        # Batched case: process in chunks along batch dimension
         if coords.dim() == 3:
-            positive = dist_sq > 0
-            threshold_sq = candidate_threshold_sq.unsqueeze(0)
-            within = dist_sq <= threshold_sq
-            valid = (positive & within).any(dim=0)
+            B = coords.shape[0]
+            Pc = cand_index.size(0)
+            valid = torch.zeros(Pc, dtype=torch.bool, device=coords.device)
+
+            step = max(1, self.refresh_chunk_size)
+            for s in range(0, B, step):
+                e = min(B, s + step)
+                c = coords[s:e]  # (b,N,3)
+                diff = _pair_vectors(c, cand_index)          # (b,Pc,3)
+                d2 = (diff * diff).sum(dim=-1)               # (b,Pc)
+                hit = (d2 > 0) & (d2 <= cand_thresh_sq.unsqueeze(0))
+                valid |= hit.any(dim=0)
+
         else:
-            positive = dist_sq > 0
-            within = dist_sq <= candidate_threshold_sq
+            diff = _pair_vectors(coords, cand_index)          # (Pc,3)
+            d2 = (diff * diff).sum(dim=-1)                    # (Pc,)
+            positive = d2 > 0
+            within = d2 <= cand_thresh_sq
             valid = positive & within
+
         if valid.any():
-            new_index = candidate_index[valid]
-            new_min = candidate_min[valid]
-            new_depth = candidate_depth[valid]
-            new_threshold = candidate_threshold[valid]
+            self.nonbond_index = cand_index[valid]
+            self.vdw_minimum = cand_min[valid]
+            self.vdw_well_depth = cand_depth[valid]
+            self.vdw_threshold = cand_thresh[valid]
+            self.vdw_threshold_sq = cand_thresh_sq[valid]
         else:
-            new_index = candidate_index.new_empty((0, 2))
-            new_min = candidate_min.new_empty((0,))
-            new_depth = candidate_depth.new_empty((0,))
-            new_threshold = candidate_threshold.new_empty((0,))
-        self.nonbond_index = new_index
-        self.vdw_minimum = new_min
-        self.vdw_well_depth = new_depth
-        self.vdw_threshold = new_threshold
-        self.vdw_threshold_sq = new_threshold.square()
+            self.nonbond_index = cand_index.new_empty((0, 2))
+            self.vdw_minimum = cand_min.new_empty((0,))
+            self.vdw_well_depth = cand_depth.new_empty((0,))
+            self.vdw_threshold = cand_thresh.new_empty((0,))
+            self.vdw_threshold_sq = cand_thresh_sq.new_empty((0,))
+
+    # -------------------------- GPU 1–2/1–3 blocked keys --------------------------
+
+    def _blocked_keys_12_13_gpu(self, bond_index: torch.Tensor, n: int) -> torch.Tensor:
+        """
+        Build sorted 1D keys (i*n + j) to EXCLUDE pairs (upper triangle only):
+        - 1–2 (direct bonds)
+        - 1–3 (neighbors-of-neighbors)
+        Implemented with torch_sparse.SparseTensor on device.
+        """
+        if bond_index.numel() == 0:
+            return bond_index.new_empty((0,), dtype=torch.long)
+
+        row = bond_index[:, 0].to(torch.long)
+        col = bond_index[:, 1].to(torch.long)
+
+        # Undirected adjacency (no self loop)
+        A = SparseTensor(row=row, col=col, sparse_sizes=(n, n))
+        A = A.set_diag(0).to_symmetric()
+
+        # 2-hop for 1–3 pairs
+        A2 = A @ A
+        A2 = A2.set_diag(0)
+
+        # Combine 1–2 and 1–3; coalesce to unique indices
+        B = (A + A2).coalesce()
+        br, bc, _ = B.coo()
+
+        # Upper triangle only to avoid duplicates
+        mask = br < bc
+        br = br[mask]
+        bc = bc[mask]
+
+        keys = br * n + bc
+        return torch.sort(keys).values
+
+    # -------------------------- candidate build --------------------------
+
+    def _build_nonbond_candidates(
+        self,
+        coords: torch.Tensor,         # (N,3)
+        bond_index: torch.Tensor,     # (E,2) or empty
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Build candidate nonbond pairs with a broad geometric prefilter, then
+        apply (i) atom validity, (ii) inter-fragment policy at radius_graph stage,
+        (iii) 1–2/1–3 exclusions (GPU), and (iv) pair-specific cutoff prefilter.
+
+        Returns:
+            (cand_index [P,2], Rij [P], Dij [P], cutoff [P])
+        where Rij = R*_i + R*_j, Dij = sqrt(D_i D_j),
+              cutoff = m * Rij  (m = vdw_distance_multiplier).
+        """
+        device = coords.device
+        dtype = coords.dtype
+        n = self.n_atoms
+
+        # global safe radius: r_glob = 2 * m * max(R*)
+        if self.vdw_atom_valid.any():
+            Rmax = self.vdw_atom_R[self.vdw_atom_valid].max()
+        else:
+            Rmax = torch.tensor(0.0, device=device, dtype=dtype)
+        r_glob = float(2.0 * self._vdw_distance_multiplier * torch.clamp(
+            Rmax, min=torch.finfo(dtype).eps
+        ))
+
+        # Step 1. geometric neighbor graph with optional fragment batching
+        batch = None
+        if (not self._allow_interfragment) and (self._fragment_ids is not None):
+            batch = self._fragment_ids
+        edge_index = radius_graph(coords, r=r_glob, loop=False, max_num_neighbors=1024, batch=batch)
+        src, dst = edge_index[0], edge_index[1]
+
+        # Step 2. make undirected, keep i<j (unique-by-construction; no torch.unique)
+        i = torch.minimum(src, dst)
+        j = torch.maximum(src, dst)
+        keep = i < j
+        i, j = i[keep], j[keep]
+
+        # Early exit
+        if i.numel() == 0:
+            empty_idx = torch.empty((0, 2), device=device, dtype=torch.long)
+            empty_f = torch.empty((0,), device=device, dtype=dtype)
+            return empty_idx, empty_f, empty_f, empty_f
+
+        # Step 3. per-atom validity (inter-fragment already handled via batch above)
+        pair_ok = self.vdw_atom_valid[i] & self.vdw_atom_valid[j]
+        i, j = i[pair_ok], j[pair_ok]
+
+        if i.numel() == 0:
+            empty_idx = torch.empty((0, 2), device=device, dtype=torch.long)
+            empty_f = torch.empty((0,), device=device, dtype=dtype)
+            return empty_idx, empty_f, empty_f, empty_f
+
+        # Step 4. 1–2 / 1–3 exclusions (GPU, sorted-bucketize)
+        if bond_index.numel():
+            blocked = self._blocked_keys_12_13_gpu(bond_index.to(device), n)
+            if blocked.numel():
+                keys = i * n + j
+                order = torch.argsort(keys)
+                keys_sorted = keys[order]
+                pos = torch.bucketize(keys_sorted, blocked)          # blocked is sorted
+                hit = (pos > 0) & (blocked[pos - 1] == keys_sorted)  # membership
+                keep_sorted = ~hit
+
+                keep_mask = torch.empty_like(keep_sorted)
+                keep_mask[order] = keep_sorted
+
+                i, j = i[keep_mask], j[keep_mask]
+
+        if i.numel() == 0:
+            empty_idx = torch.empty((0, 2), device=device, dtype=torch.long)
+            empty_f = torch.empty((0,), device=device, dtype=dtype)
+            return empty_idx, empty_f, empty_f, empty_f
+
+        # Step 5. pairwise parameters & pair-specific cutoff (+ initial distance prefilter)
+        Rij = self.vdw_atom_R[i] + self.vdw_atom_R[j]  # (P,)
+        Dij = torch.sqrt(torch.clamp(self.vdw_atom_D[i] * self.vdw_atom_D[j], min=0.0))  # (P,)
+        cutoff = self._vdw_distance_multiplier * Rij
+
+        # Prefilter by actual distance <= cutoff to shrink candidate pool further
+        d2 = (coords[i] - coords[j]).pow(2).sum(dim=-1)
+        keep2 = d2 <= cutoff.pow(2)
+        i, j = i[keep2], j[keep2]
+        Rij = Rij[keep2]
+        Dij = Dij[keep2]
+        cutoff = cutoff[keep2]
+
+        if i.numel() == 0:
+            empty_idx = torch.empty((0, 2), device=device, dtype=torch.long)
+            empty_f = torch.empty((0,), device=device, dtype=dtype)
+            return empty_idx, empty_f, empty_f, empty_f
+
+        # Step 6. sort candidates by (i*n + j) to improve gather locality
+        keys = i * n + j
+        order = torch.argsort(keys)
+        i = i[order]
+        j = j[order]
+        Rij = Rij[order]
+        Dij = Dij[order]
+        cutoff = cutoff[order]
+
+        cand_index = torch.stack([i, j], dim=1).contiguous()
+        return cand_index, Rij, Dij, cutoff
