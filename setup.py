@@ -145,6 +145,20 @@ def _boost_include_dirs(existing: list[str], lib_dirs: list[Path]) -> list[str]:
     for candidate in rdconfig_candidates:
         _maybe_add(candidate, include_dirs, seen)
 
+    prefix_candidates = {
+        Path(sys.prefix),
+        Path(sys.exec_prefix),
+        Path(getattr(sys, "base_prefix", "")),
+        Path(getattr(sys, "base_exec_prefix", "")),
+        Path(os.environ.get("CONDA_PREFIX", "")),
+        Path(os.environ.get("VIRTUAL_ENV", "")),
+    }
+    for prefix in prefix_candidates:
+        if not prefix:
+            continue
+        _maybe_add(prefix / "include", include_dirs, seen)
+        _maybe_add(prefix / "include" / "boost", include_dirs, seen)
+
     for lib_dir in lib_dirs:
         _maybe_add(lib_dir.parent / "include", include_dirs, seen)
         _maybe_add(lib_dir.parent / "include" / "boost", include_dirs, seen)
