@@ -101,10 +101,58 @@ def _rdkit_include_dirs() -> list[str]:
             include_dirs.append(resolved)
             seen.add(resolved)
 
-    if not include_dirs:
+    return include_dirs
+
+
+def _maybe_add(path: Path, dest: list[str], seen: set[str]) -> None:
+    if not path:
+        return
+    if path.is_dir():
+        resolved = str(path)
+        if resolved not in seen:
+            dest.append(resolved)
+            seen.add(resolved)
+
+
+def _boost_include_dirs(existing: list[str], lib_dirs: list[Path]) -> list[str]:
+    """Augment *existing* include directories with Boost headers if needed."""
+
+    def has_boost_header(directory: str) -> bool:
+        return (Path(directory) / "boost" / "python.hpp").is_file()
+
+    if any(has_boost_header(path) for path in existing):
+        return existing
+
+    include_dirs = list(existing)
+    seen = set(include_dirs)
+
+    env_dirs = os.environ.get("BOOST_INCLUDEDIR", "")
+    if env_dirs:
+        for entry in env_dirs.split(os.pathsep):
+            if entry:
+                _maybe_add(Path(entry), include_dirs, seen)
+
+    boost_root = os.environ.get("BOOST_ROOT")
+    if boost_root:
+        root = Path(boost_root)
+        _maybe_add(root / "include", include_dirs, seen)
+        _maybe_add(root / "include" / "boost", include_dirs, seen)
+
+    rdconfig_candidates = [
+        Path(getattr(RDConfig, "boostIncludeDir", "")),
+        Path(getattr(RDConfig, "RDBoostDir", "")),
+    ]
+    for candidate in rdconfig_candidates:
+        _maybe_add(candidate, include_dirs, seen)
+
+    for lib_dir in lib_dirs:
+        _maybe_add(lib_dir.parent / "include", include_dirs, seen)
+        _maybe_add(lib_dir.parent / "include" / "boost", include_dirs, seen)
+
+    if not any(has_boost_header(path) for path in include_dirs):
         raise RuntimeError(
-            "Could not determine RDKit include directories."
-            " Set RDKIT_INCLUDE_DIR explicitly."
+            "Could not locate Boost headers (missing boost/python.hpp)."
+            " Set BOOST_INCLUDEDIR or BOOST_ROOT explicitly."
         )
 
     return include_dirs
@@ -176,7 +224,13 @@ libraries.append(boost_resolved)
 runtime_dirs.add(str(boost_dir))
 
 python_include = sysconfig.get_paths()["include"]
-include_dirs = [python_include, * _rdkit_include_dirs()]
+rdkit_includes = _rdkit_include_dirs()
+if not rdkit_includes:
+    raise RuntimeError(
+        "Could not determine RDKit include directories."
+        " Set RDKIT_INCLUDE_DIR explicitly."
+    )
+include_dirs = _boost_include_dirs([python_include, *rdkit_includes], lib_dirs)
 
 ext_modules = [
     Extension(
