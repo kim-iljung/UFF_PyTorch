@@ -21,7 +21,7 @@ dependencies = [
 classifiers = [
   "Programming Language :: Python",
   "Programming Language :: Python :: 3",
-  "License :: OSI Approved :: BSD License",
+  "License :: OSI Approved :: MIT License",
   "Operating System :: OS Independent",
   "Topic :: Scientific/Engineering :: Chemistry",
   "Topic :: Scientific/Engineering :: Artificial Intelligence"
