@@ -164,6 +164,18 @@ def _boost_include_dirs(existing: list[str], lib_dirs: list[Path]) -> list[str]:
         _maybe_add(lib_dir.parent / "include" / "boost", include_dirs, seen)
 
     if not any(has_boost_header(path) for path in include_dirs):
+        expanded = list(include_dirs)
+        for entry in expanded:
+            base = Path(entry)
+            if not base.is_dir():
+                continue
+            for candidate in base.glob("boost-*"):
+                if not candidate.is_dir():
+                    continue
+                _maybe_add(candidate, include_dirs, seen)
+                _maybe_add(candidate / "include", include_dirs, seen)
+
+    if not any(has_boost_header(path) for path in include_dirs):
         raise RuntimeError(
             "Could not locate Boost headers (missing boost/python.hpp)."
             " Set BOOST_INCLUDEDIR or BOOST_ROOT explicitly."
