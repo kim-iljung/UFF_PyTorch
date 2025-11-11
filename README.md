@@ -16,7 +16,24 @@ energies and forces can be obtained via autograd.
 
 ## Installation
 
-You can install the package from a Git checkout:
+### Dependencies
+
+The package requires the following Python dependencies (versions shown are the
+minimum supported):
+
+- Python 3.8 or newer
+- [PyTorch](https://pytorch.org/) 1.12+
+- [RDKit](https://www.rdkit.org/) 2022.03.1+
+- [torch-cluster](https://github.com/rusty1s/pytorch_cluster) 1.6.0+
+- [torch-sparse](https://github.com/rusty1s/pytorch_sparse) 0.6.0+
+
+`torch-cluster` and `torch-sparse` provide the accelerated neighbor search and
+sparse linear algebra used by the non-bonded fast path.  Ensure that the wheel
+builds for your platform and PyTorch version are available; consult the
+respective project documentation if you need to install from source.
+
+You can install the package from a Git checkout once the dependencies are
+available in your environment:
 
 ```bash
 pip install git+https://github.com/kim-iljung/UFF_PyTorch.git
