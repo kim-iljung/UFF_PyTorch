@@ -7,6 +7,11 @@ import warnings
 from rdkit.Chem import GetPeriodicTable
 from rdkit.Chem.rdchem import Atom, HybridizationType
 
+try:
+    from ._atom_typing import uff_atom_type as _cxx_uff_atom_type
+except ImportError:  # pragma: no cover - fallback for missing extension
+    _cxx_uff_atom_type = None
+
 
 _PT = GetPeriodicTable()
 
@@ -212,7 +217,9 @@ def _append_charge(
     return atom_key
 
 
-def uff_atom_type(atom: Atom, *, tolerate_charge_mismatch: bool = False) -> str:
+def _python_uff_atom_type(
+    atom: Atom, *, tolerate_charge_mismatch: bool = False
+) -> str:
     """Return the UFF atom type label used by RDKit."""
 
     symbol = atom.GetSymbol()
@@ -266,3 +273,13 @@ def uff_atom_type(atom: Atom, *, tolerate_charge_mismatch: bool = False) -> str:
         atom, atom_key, tolerate_charge_mismatch=tolerate_charge_mismatch
     )
     return atom_key
+
+
+def uff_atom_type(atom: Atom, *, tolerate_charge_mismatch: bool = False) -> str:
+    """Return the UFF atom type label used by RDKit."""
+
+    if _cxx_uff_atom_type is not None:
+        return _cxx_uff_atom_type(atom, tolerate_charge_mismatch)
+    return _python_uff_atom_type(
+        atom, tolerate_charge_mismatch=tolerate_charge_mismatch
+    )
