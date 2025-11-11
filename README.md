@@ -21,7 +21,7 @@ energies and forces can be obtained via autograd.
 The package requires the following Python dependencies (versions shown are the
 minimum supported):
 
-- Python 3.8 or newer
+- Python 3.8+
 - [PyTorch](https://pytorch.org/) 1.12+
 - [RDKit](https://www.rdkit.org/) 2022.03.1+
 - [torch-cluster](https://github.com/rusty1s/pytorch_cluster) 1.6.0+
