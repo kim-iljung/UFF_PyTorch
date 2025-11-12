@@ -71,6 +71,7 @@ def _extract_vdw_params(
     Extract per-atom VdW parameters (R*_i, D_i) from UFFAtomParameters list.
     Returns: (valid_mask [N], R [N], D [N])
     Tries common field names: vdw_minimum/r_vdw and vdw_well_depth/epsilon.
+    Falls back to the canonical RDKit column names (x1, D1).
     """
     n = len(atom_params)
     valid = torch.zeros(n, device=device, dtype=torch.bool)
@@ -82,9 +83,13 @@ def _extract_vdw_params(
         r_i = getattr(p, "vdw_minimum", None)
         if r_i is None:
             r_i = getattr(p, "r_vdw", None)
+        if r_i is None:
+            r_i = getattr(p, "x1", None)
         d_i = getattr(p, "vdw_well_depth", None)
         if d_i is None:
             d_i = getattr(p, "epsilon", None)
+        if d_i is None:
+            d_i = getattr(p, "D1", None)
         if r_i is None or d_i is None:
             continue
         R[idx] = float(r_i)
@@ -522,7 +527,7 @@ class UFFTorch(nn.Module):
 
         Returns:
             (cand_index [P,2], Rij [P], Dij [P], cutoff [P])
-        where Rij = R*_i + R*_j, Dij = sqrt(D_i D_j),
+        where Rij = sqrt(R*_i R*_j), Dij = sqrt(D_i D_j),
               cutoff = m * Rij  (m = vdw_distance_multiplier).
         """
         device = coords.device
@@ -573,7 +578,11 @@ class UFFTorch(nn.Module):
                 keys = i * n + j
                 order = torch.argsort(keys)
                 keys_sorted = keys[order]
-                pos = torch.bucketize(keys_sorted, blocked)          # blocked is sorted
+                # torch.bucketize(..., right=True) returns the upper-bound index so
+                # that ``pos - 1`` points at the candidate on equality.  Using the
+                # default ``right=False`` would place exact matches at index 0 and
+                # skip them because ``pos > 0`` would be false.
+                pos = torch.bucketize(keys_sorted, blocked, right=True)  # blocked is sorted
                 hit = (pos > 0) & (blocked[pos - 1] == keys_sorted)  # membership
                 keep_sorted = ~hit
 
@@ -588,7 +597,7 @@ class UFFTorch(nn.Module):
             return empty_idx, empty_f, empty_f, empty_f
 
         # Step 5. pairwise parameters & pair-specific cutoff (+ initial distance prefilter)
-        Rij = self.vdw_atom_R[i] + self.vdw_atom_R[j]  # (P,)
+        Rij = torch.sqrt(torch.clamp(self.vdw_atom_R[i] * self.vdw_atom_R[j], min=0.0))  # (P,)
         Dij = torch.sqrt(torch.clamp(self.vdw_atom_D[i] * self.vdw_atom_D[j], min=0.0))  # (P,)
         cutoff = self._vdw_distance_multiplier * Rij
 
@@ -608,11 +617,30 @@ class UFFTorch(nn.Module):
         # Step 6. sort candidates by (i*n + j) to improve gather locality
         keys = i * n + j
         order = torch.argsort(keys)
-        i = i[order]
-        j = j[order]
-        Rij = Rij[order]
-        Dij = Dij[order]
-        cutoff = cutoff[order]
+        keys_sorted = keys[order]
+        i_sorted = i[order]
+        j_sorted = j[order]
+        Rij_sorted = Rij[order]
+        Dij_sorted = Dij[order]
+        cutoff_sorted = cutoff[order]
+
+        # radius_graph emits both directions (i,j) and (j,i); after enforcing
+        # i<j we still retain duplicate entries.  Drop them while preserving the
+        # original sorted order so we match RDKit's single-contribution pairs.
+        if keys_sorted.numel():
+            dedup = torch.ones_like(keys_sorted, dtype=torch.bool)
+            dedup[1:] = keys_sorted[1:] != keys_sorted[:-1]
+            i = i_sorted[dedup]
+            j = j_sorted[dedup]
+            Rij = Rij_sorted[dedup]
+            Dij = Dij_sorted[dedup]
+            cutoff = cutoff_sorted[dedup]
+        else:
+            i = i_sorted
+            j = j_sorted
+            Rij = Rij_sorted
+            Dij = Dij_sorted
+            cutoff = cutoff_sorted
 
         cand_index = torch.stack([i, j], dim=1).contiguous()
         return cand_index, Rij, Dij, cutoff
