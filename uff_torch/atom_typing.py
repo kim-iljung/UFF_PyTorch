@@ -7,7 +7,6 @@
 # References for UFF naming and defaults:
 #   - Rappé et al., JACS 1992 (UFF), and commonly used type list conventions like:
 #     Zn3+2, Se3+2, Fe3+2 / Fe6+2, Pd4+2, Ag1+1, Hg1+2, etc.
-#   - See comments at bottom for quick usage.
 
 from __future__ import annotations
 import warnings
