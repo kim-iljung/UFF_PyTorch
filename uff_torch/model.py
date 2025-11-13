@@ -644,3 +644,190 @@ class UFFTorch(nn.Module):
 
         cand_index = torch.stack([i, j], dim=1).contiguous()
         return cand_index, Rij, Dij, cutoff
+        
+    def _refresh_nonbond_candidates(self, coords: torch.Tensor) -> None:
+        """
+        Rebuild nonbond_candidate_* from coords.
+        - coords: (N, 3) 또는 (B, N, 3)
+        - (B,N,3)인 경우, 배치 전체에서 등장하는 (i,j) 페어의 union을 만들어 후보 풀을 갱신한다.
+        - 이후 forward()에서 _refresh_nonbond_pairs가 이 후보 풀을 기반으로
+          실제 활성 nonbond_index를 coords에 맞게 다시 뽑는다.
+        """
+        # coords를 reference 기준으로 정리 (이미 있는 헬퍼 재사용)
+        coords = _prepare_coords(coords, self.reference_coords)
+        device = coords.device
+        dtype = coords.dtype
+        n = self.n_atoms
+
+        # 단일 샘플이면 기존 _build_nonbond_candidates 한 번 쓰고 끝
+        if coords.dim() == 2:
+            cand_index, Rij, Dij, cutoff = self._build_nonbond_candidates(
+                coords=coords,
+                bond_index=self.bond_index,
+            )
+            # candidate 버퍼 갱신
+            self.nonbond_candidate_index = cand_index
+            self.nonbond_candidate_minimum = Rij
+            self.nonbond_candidate_well_depth = Dij
+            self.nonbond_candidate_threshold = cutoff
+            self.nonbond_candidate_threshold_sq = cutoff.square()
+            return
+
+        # 배치 처리: coords.shape == (B, N, 3)
+        if coords.dim() != 3:
+            raise ValueError("coords must be (N,3) or (B,N,3)")
+
+        B, N, _ = coords.shape
+        if N != n:
+            raise ValueError(f"coords second dim {N} must match n_atoms {n}")
+
+        # ---------- 1. global safe radius ----------
+        if self.vdw_atom_valid.any():
+            Rmax = self.vdw_atom_R[self.vdw_atom_valid].max()
+        else:
+            Rmax = torch.tensor(0.0, device=device, dtype=dtype)
+        r_glob = float(
+            2.0 * self._vdw_distance_multiplier * torch.clamp(
+                Rmax, min=torch.finfo(dtype).eps
+            )
+        )
+
+        # ---------- 2. flatten coords + batch label ----------
+        coords_flat = coords.reshape(B * N, 3)  # (B*N, 3)
+
+        # 배치 라벨: (batch_id, fragment_id)를 하나의 정수로 encode해서
+        # fragment 간, batch 간 edge가 섞이지 않도록 한다.
+        if (not self._allow_interfragment) and (self._fragment_ids is not None):
+            frag = self._fragment_ids.to(device=device)          # (N,)
+            frag_tiled = frag.unsqueeze(0).expand(B, N).reshape(-1)  # (B*N,)
+            F = int(frag_tiled.max().item()) + 1
+            batch_graph = torch.arange(B, device=device).repeat_interleave(N)  # (B*N,)
+            batch = batch_graph * F + frag_tiled
+        else:
+            batch = torch.arange(B, device=device).repeat_interleave(N)
+
+        edge_index = radius_graph(
+            coords_flat,
+            r=r_glob,
+            loop=False,
+            max_num_neighbors=1024,
+            batch=batch,
+        )
+        src, dst = edge_index[0], edge_index[1]
+
+        if src.numel() == 0:
+            empty_idx = torch.empty((0, 2), device=device, dtype=torch.long)
+            empty_f = torch.empty((0,), device=device, dtype=dtype)
+            self.nonbond_candidate_index = empty_idx
+            self.nonbond_candidate_minimum = empty_f
+            self.nonbond_candidate_well_depth = empty_f
+            self.nonbond_candidate_threshold = empty_f
+            self.nonbond_candidate_threshold_sq = empty_f
+            return
+
+        # ---------- 3. (i,j)를 base 인덱스로 내려서 i<j만 유지 ----------
+        # flatten index → 공통 atom index (0..N-1)
+        i_base = src % n
+        j_base = dst % n
+
+        i = torch.minimum(i_base, j_base)
+        j = torch.maximum(i_base, j_base)
+        keep = i < j
+        i, j = i[keep], j[keep]
+
+        if i.numel() == 0:
+            empty_idx = torch.empty((0, 2), device=device, dtype=torch.long)
+            empty_f = torch.empty((0,), device=device, dtype=dtype)
+            self.nonbond_candidate_index = empty_idx
+            self.nonbond_candidate_minimum = empty_f
+            self.nonbond_candidate_well_depth = empty_f
+            self.nonbond_candidate_threshold = empty_f
+            self.nonbond_candidate_threshold_sq = empty_f
+            return
+
+        # ---------- 4. per-atom validity ----------
+        pair_ok = self.vdw_atom_valid[i] & self.vdw_atom_valid[j]
+        i, j = i[pair_ok], j[pair_ok]
+
+        if i.numel() == 0:
+            empty_idx = torch.empty((0, 2), device=device, dtype=torch.long)
+            empty_f = torch.empty((0,), device=device, dtype=dtype)
+            self.nonbond_candidate_index = empty_idx
+            self.nonbond_candidate_minimum = empty_f
+            self.nonbond_candidate_well_depth = empty_f
+            self.nonbond_candidate_threshold = empty_f
+            self.nonbond_candidate_threshold_sq = empty_f
+            return
+
+        # ---------- 5. 1–2 / 1–3 제외 (기존 blocked 키 재사용) ----------
+        if self.bond_index.numel():
+            blocked = self._blocked_keys_12_13_gpu(self.bond_index.to(device), n)
+            if blocked.numel():
+                keys = i * n + j
+                order = torch.argsort(keys)
+                keys_sorted = keys[order]
+
+                pos = torch.bucketize(keys_sorted, blocked, right=True)
+                hit = (pos > 0) & (blocked[pos - 1] == keys_sorted)
+                keep_sorted = ~hit
+
+                keep_mask = torch.empty_like(keep_sorted)
+                keep_mask[order] = keep_sorted
+
+                i = i[keep_mask]
+                j = j[keep_mask]
+
+        if i.numel() == 0:
+            empty_idx = torch.empty((0, 2), device=device, dtype=torch.long)
+            empty_f = torch.empty((0,), device=device, dtype=dtype)
+            self.nonbond_candidate_index = empty_idx
+            self.nonbond_candidate_minimum = empty_f
+            self.nonbond_candidate_well_depth = empty_f
+            self.nonbond_candidate_threshold = empty_f
+            self.nonbond_candidate_threshold_sq = empty_f
+            return
+
+        # ---------- 6. pair별 UFF 파라미터 & cutoff ----------
+        Rij = torch.sqrt(torch.clamp(self.vdw_atom_R[i] * self.vdw_atom_R[j], min=0.0))  # (P,)
+        Dij = torch.sqrt(torch.clamp(self.vdw_atom_D[i] * self.vdw_atom_D[j], min=0.0))  # (P,)
+        cutoff = self._vdw_distance_multiplier * Rij                                      # (P,)
+
+        # 여기서는 per-pair cutoff로 다시 거리 prefilter까지 넣으려면
+        # 배치 전체에서 min distance를 구해야 해서 scatter가 좀 필요함.
+        # 일단 r_glob로 이미 한번 잘라졌으니, 여기서는 prefilter 생략하고
+        # 정렬 + 중복제거만 해도 충분히 candidate 수가 제어될 가능성이 큼.
+
+        # ---------- 7. (i*n + j) 기준 정렬 + 중복 제거 ----------
+        keys = i * n + j
+        order = torch.argsort(keys)
+        keys_sorted = keys[order]
+        i_sorted = i[order]
+        j_sorted = j[order]
+        Rij_sorted = Rij[order]
+        Dij_sorted = Dij[order]
+        cutoff_sorted = cutoff[order]
+
+        if keys_sorted.numel():
+            dedup = torch.ones_like(keys_sorted, dtype=torch.bool)
+            dedup[1:] = keys_sorted[1:] != keys_sorted[:-1]
+
+            i_final = i_sorted[dedup]
+            j_final = j_sorted[dedup]
+            Rij_final = Rij_sorted[dedup]
+            Dij_final = Dij_sorted[dedup]
+            cutoff_final = cutoff_sorted[dedup]
+        else:
+            i_final = i_sorted
+            j_final = j_sorted
+            Rij_final = Rij_sorted
+            Dij_final = Dij_sorted
+            cutoff_final = cutoff_sorted
+
+        cand_index = torch.stack([i_final, j_final], dim=1).contiguous()
+
+        # ---------- 8. candidate 버퍼 갱신 ----------
+        self.nonbond_candidate_index = cand_index
+        self.nonbond_candidate_minimum = Rij_final
+        self.nonbond_candidate_well_depth = Dij_final
+        self.nonbond_candidate_threshold = cutoff_final
+        self.nonbond_candidate_threshold_sq = cutoff_final.square()
