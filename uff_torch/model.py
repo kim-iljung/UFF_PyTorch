@@ -98,6 +98,94 @@ def _extract_vdw_params(
     return valid, R, D
 
 
+# ------------------------------ autograd kernels ------------------------------
+
+
+class _NonbondedEnergy(torch.autograd.Function):
+    """
+    Custom LJ 12-6 evaluator with fused backward to shrink autograd graph.
+    Expects broadcast-ready vdW buffers and per-pair thresholds.
+    """
+
+    @staticmethod
+    def forward(  # type: ignore[override]
+        ctx,
+        coords: torch.Tensor,
+        index: torch.Tensor,
+        vdw_minimum: torch.Tensor,
+        vdw_depth: torch.Tensor,
+        threshold_sq: torch.Tensor,
+    ) -> torch.Tensor:
+        diff = _pair_vectors(coords, index)  # (..., P, 3)
+        dist_sq = (diff * diff).sum(dim=-1)  # (..., P)
+
+        if coords.dim() == 2:
+            thresh_sq = threshold_sq
+            vdw_min = vdw_minimum
+            vdw_D = vdw_depth
+        else:
+            thresh_sq = threshold_sq.unsqueeze(0)
+            vdw_min = vdw_minimum.unsqueeze(0)
+            vdw_D = vdw_depth.unsqueeze(0)
+
+        valid = (dist_sq > 0) & (dist_sq <= thresh_sq)
+        dist_sq_safe = dist_sq.clamp_min(1e-12)
+
+        inv_dist = torch.rsqrt(dist_sq_safe)
+        r = vdw_min * inv_dist
+        r2 = r * r
+        r4 = r2 * r2
+        r6 = r4 * r2
+        r12 = r6 * r6
+        energy = vdw_D * (r12 - 2.0 * r6)
+        energy = energy.masked_fill(~valid, 0.0)
+
+        ctx.save_for_backward(coords, index, vdw_minimum, vdw_depth, dist_sq_safe, valid)
+        ctx.is_batched = coords.dim() == 3
+
+        return energy.sum() if coords.dim() == 2 else energy.sum(dim=-1)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):  # type: ignore[override]
+        coords, index, vdw_minimum, vdw_depth, dist_sq, valid = ctx.saved_tensors
+        batched = ctx.is_batched
+
+        diff = _pair_vectors(coords, index)
+        inv_dist = torch.rsqrt(dist_sq)
+
+        if batched:
+            vdw_min = vdw_minimum.unsqueeze(0)
+            vdw_D = vdw_depth.unsqueeze(0)
+        else:
+            vdw_min = vdw_minimum
+            vdw_D = vdw_depth
+
+        r = vdw_min * inv_dist
+        r2 = r * r
+        r4 = r2 * r2
+        r6 = r4 * r2
+        r12 = r6 * r6
+
+        force_mag = -12.0 * vdw_D * (r12 - r6) / dist_sq
+        force_mag = force_mag.masked_fill(~valid, 0.0)
+
+        if batched:
+            scale = grad_output.unsqueeze(-1)
+            grad_pair = (force_mag * scale).unsqueeze(-1) * diff  # (B,P,3)
+            grad_coords = torch.zeros_like(coords)
+            idx_i = index[None, :, 0, None].expand_as(grad_pair)
+            idx_j = index[None, :, 1, None].expand_as(grad_pair)
+            grad_coords.scatter_add_(1, idx_i, grad_pair)
+            grad_coords.scatter_add_(1, idx_j, -grad_pair)
+        else:
+            grad_pair = (force_mag * grad_output).unsqueeze(-1) * diff  # (P,3)
+            grad_coords = torch.zeros_like(coords)
+            grad_coords.index_add_(0, index[:, 0], grad_pair)
+            grad_coords.index_add_(0, index[:, 1], -grad_pair)
+
+        return grad_coords, None, None, None, None
+
+
 # ------------------------------ main module ------------------------------
 
 
@@ -392,32 +480,13 @@ class UFFTorch(nn.Module):
     def _nonbonded_energy(self, coords: torch.Tensor) -> torch.Tensor:
         if self.nonbond_index.numel() == 0:
             return torch.zeros((), device=coords.device, dtype=coords.dtype)
-
-        diff = _pair_vectors(coords, self.nonbond_index)        # (..., Pnb, 3)
-        dist_sq = (diff * diff).sum(dim=-1)                     # (..., Pnb)
-        inv_dist = torch.rsqrt(dist_sq.clamp_min(1e-12))
-
-        if coords.dim() == 2:
-            thresh_sq = self.vdw_threshold_sq
-            vdw_min = self.vdw_minimum
-            vdw_depth = self.vdw_well_depth
-        else:
-            thresh_sq = self.vdw_threshold_sq.unsqueeze(0)
-            vdw_min = self.vdw_minimum.unsqueeze(0)
-            vdw_depth = self.vdw_well_depth.unsqueeze(0)
-
-        valid = (dist_sq > 0) & (dist_sq <= thresh_sq)
-
-        # Lennard-Jones 12-6 using UFF mixing: E = D_ij [ (Rij/r)^12 - 2 (Rij/r)^6 ]
-        r = vdw_min * inv_dist
-        r2 = torch.square(r)
-        r4 = torch.square(r2)
-        r6 = r4 * r2
-        r12 = torch.square(r6)
-        energy = vdw_depth * (r12 - 2.0 * r6)
-        energy = energy.masked_fill(~valid, 0.0)
-
-        return energy.sum() if coords.dim() == 2 else energy.sum(dim=-1)
+        return _NonbondedEnergy.apply(
+            coords,
+            self.nonbond_index,
+            self.vdw_minimum,
+            self.vdw_well_depth,
+            self.vdw_threshold_sq,
+        )
 
     # -------------------------- dynamic activation --------------------------
 
